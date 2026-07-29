@@ -1,12 +1,12 @@
 {
-  "name": "csv-music-downloader",
+  "name": "rip-kit",
   "version": "2.0.0",
   "description": "Turn a playlist CSV into tagged MP3s with album art.",
   "license": "MIT",
   "author": "drewjordan414",
   "repository": {
     "type": "git",
-    "url": "https://github.com/drewjordan414/csv-music-downloader.git"
+    "url": "https://github.com/drewjordan414/RipKit.git"
   },
   "type": "commonjs",
   "main": "server.js",

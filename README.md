@@ -75,8 +75,8 @@ winget install Gyan.FFmpeg
 ### Run
 
 ```bash
-git clone https://github.com/drewjordan414/csv-music-downloader.git
-cd csv-music-downloader
+git clone https://github.com/drewjordan414/RipKit.git
+cd RipKit
 
 npm install
 npm start          # builds the UI, then serves it at http://localhost:3000

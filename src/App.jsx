@@ -371,7 +371,7 @@ export default function App () {
       )}
 
       <footer>
-        <a href='https://github.com/drewjordan414/csv-music-downloader' target='_blank' rel='noopener noreferrer'>Source</a>
+        <a href='https://github.com/drewjordan414/RipKit' target='_blank' rel='noopener noreferrer'>Source</a>
         <span>Download only what you have the right to.</span>
       </footer>
     </main>
