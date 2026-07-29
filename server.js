@@ -15,7 +15,7 @@ const upload = multer({ dest: 'uploads/' })
 app.use(express.static('dist'))
 
 // simple in-memory progress tracker (single-user / local use)
-const progress = { total: 0, done: 0, current: '', detail: '' }
+const progress = { total: 0, done: 0, tracks: [] }
 
 // what each output format can carry. cover art needs a container that holds a
 // video stream (or FLAC pictures); id3 tags are mp3-only.
@@ -171,8 +171,9 @@ function downloadAudio (url, outputTemplate, userQuality, format) {
   return youtubedl(url, opts)
 }
 
-// 2) Fetch album art from iTunes (square) and save as JPG
-async function fetchAlbumArt (title, artist, tempFolder, fileBase) {
+// 2a) Ask iTunes for a square cover URL. Cheap enough to run before a rip so
+// the tracklist can show artwork while everything is still queued.
+async function lookupArt (title, artist) {
   try {
     const term = `${title} ${artist}`
     const apiURL = `https://itunes.apple.com/search?term=${encodeURIComponent(
@@ -193,28 +194,63 @@ async function fetchAlbumArt (title, artist, tempFolder, fileBase) {
 
     // artworkUrl100 is square 100x100; we can often get a larger square:
     // .../100x100bb.jpg -> .../600x600bb.jpg
-    let artUrl = json.results[0].artworkUrl100
-    if (artUrl) {
-      artUrl = artUrl.replace(/100x100bb\.jpg$/, '600x600bb.jpg')
-    }
+    const artUrl = json.results[0].artworkUrl100
+    return artUrl ? artUrl.replace(/100x100bb\.jpg$/, '600x600bb.jpg') : null
+  } catch (err) {
+    console.log('Error looking up album art:', err)
+    return null
+  }
+}
 
+// 2b) Download that cover to disk so ffmpeg can embed it
+async function saveArt (artUrl, tempFolder, fileBase) {
+  if (!artUrl) return null
+  try {
     const imgRes = await fetch(artUrl)
     if (!imgRes.ok) {
       console.log('Failed to download artwork:', artUrl)
       return null
     }
 
-    const arrayBuffer = await imgRes.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
-
+    const buffer = Buffer.from(await imgRes.arrayBuffer())
     const coverPath = `${tempFolder}/${fileBase}_cover.jpg`
     await fs.promises.writeFile(coverPath, buffer)
-
     return coverPath
   } catch (err) {
-    console.log('Error fetching album art:', err)
+    console.log('Error saving album art:', err)
     return null
   }
+}
+
+// Pull the fields we care about out of one CSV row, whatever it calls them
+function toTrack (row) {
+  return {
+    title: getField(row, [
+      'title', 'Title', 'track', 'Track', 'track_name', 'Track Name',
+      'trackName', 'name', 'Name', 'song', 'Song'
+    ]),
+    artist: getField(row, [
+      'artist', 'Artist', 'artists', 'Artists', 'artist_name', 'Artist Name',
+      'singer', 'Singer', 'performer', 'Performer'
+    ]),
+    album: getField(row, [
+      'album', 'Album', 'album_name', 'Album Name', 'albumName',
+      'record', 'Record', 'release', 'Release'
+    ]),
+    year: getYear(row),
+    genre: getGenre(row)
+  }
+}
+
+function parseCsv (csvPath) {
+  return new Promise((resolve, reject) => {
+    const rows = []
+    fs.createReadStream(csvPath)
+      .pipe(csv())
+      .on('data', (row) => rows.push(row))
+      .on('end', () => resolve(rows.map(toTrack)))
+      .on('error', reject)
+  })
 }
 
 // 3) Use ffmpeg to apply metadata + optional cover art
@@ -311,156 +347,133 @@ app.get('/progress', (req, res) => {
   res.json(progress)
 })
 
+// Read the CSV and hand back the tracklist (with cover art) before ripping,
+// so the page can show what it is about to do.
+app.post('/preview', upload.single('csv'), async (req, res) => {
+  try {
+    const tracks = await parseCsv(req.file.path)
+
+    // iTunes is fast but we still have one call per track — run them together
+    const withArt = await Promise.all(
+      tracks.map(async (t) => ({
+        ...t,
+        art: t.title && t.artist ? await lookupArt(t.title, t.artist) : null,
+        status: t.title && t.artist ? 'queued' : 'skipped'
+      }))
+    )
+
+    res.json({ tracks: withArt })
+  } catch (err) {
+    console.log('Preview failed:', err)
+    res.status(400).json({ error: 'Could not read that CSV.' })
+  } finally {
+    fs.promises.unlink(req.file.path).catch(() => {})
+  }
+})
+
 // Handle CSV upload → return ZIP
 app.post('/upload', upload.single('csv'), async (req, res) => {
-  const csvPath = req.file.path
-  const songs = []
   const userQuality = req.body.quality || '0'
   const format = normalizeFormat(req.body.format)
 
-  fs.createReadStream(csvPath)
-    .pipe(csv())
-    .on('data', (row) => songs.push(row))
-    .on('end', async () => {
-      const tempFolder = 'mp3s_' + Date.now()
-      fs.mkdirSync(tempFolder)
+  const songs = await parseCsv(req.file.path)
+  const tempFolder = 'mp3s_' + Date.now()
+  fs.mkdirSync(tempFolder)
 
-      progress.total = songs.length
-      progress.done = 0
-      progress.current = ''
-      progress.detail = ''
+  progress.total = songs.length
+  progress.done = 0
+  progress.tracks = songs.map((s) => ({
+    status: s.title && s.artist ? 'queued' : 'skipped',
+    detail: s.title && s.artist ? '' : 'No title or artist in this row'
+  }))
 
-      for (const s of songs) {
-        try {
-          // UNIVERSAL FIELD DETECTION
+  for (const [i, s] of songs.entries()) {
+    const track = progress.tracks[i]
+    const { title, artist, album, year, genre } = s
 
-          const title = getField(s, [
-            'title',
-            'Title',
-            'track',
-            'Track',
-            'track_name',
-            'Track Name',
-            'trackName',
-            'name',
-            'Name',
-            'song',
-            'Song'
-          ])
+    if (!title || !artist) {
+      console.log('Skipping row (no title/artist)')
+      progress.done++
+      continue
+    }
 
-          const artist = getField(s, [
-            'artist',
-            'Artist',
-            'artists',
-            'Artists',
-            'artist_name',
-            'Artist Name',
-            'singer',
-            'Singer',
-            'performer',
-            'Performer'
-          ])
+    track.status = 'working'
+    track.detail = 'searching youtube'
 
-          const album = getField(s, [
-            'album',
-            'Album',
-            'album_name',
-            'Album Name',
-            'albumName',
-            'record',
-            'Record',
-            'release',
-            'Release'
-          ])
+    try {
+      const query = `${title} ${artist}`
+      console.log('Searching:', query)
 
-          const year = getYear(s)
-          const genre = getGenre(s)
-
-          if (!title || !artist) {
-            console.log('Skipping row (no title/artist):', s)
-            progress.done++
-            continue
-          }
-
-          const query = `${title} ${artist}`
-          progress.current = query
-          progress.detail = ''
-          console.log('Searching:', query)
-
-          const results = await yts(query)
-          const video = results.videos[0]
-          if (!video) {
-            console.log('No video found for:', query)
-            progress.done++
-            continue
-          }
-
-          // filename ONLY from title, with spaces (no underscores)
-          const fileBase = makeFileBaseFromTitle(title)
-
-          // yt-dlp will write "<fileBase>.<ext>"
-          const outputTemplate = `${tempFolder}/${fileBase}.%(ext)s`
-
-          // 1) download pure audio
-          await downloadAudio(video.url, outputTemplate, userQuality, format)
-
-          const audioPath = findDownloaded(tempFolder, fileBase)
-          if (!audioPath) {
-            console.log('Download produced no file for:', query)
-            continue
-          }
-          progress.detail = probeAudio(audioPath)
-
-          // 2) fetch nice square album art (movie/album style)
-          const coverPath = await fetchAlbumArt(
-            title,
-            artist,
-            tempFolder,
-            fileBase
-          )
-
-          // 3) apply metadata from CSV + embed cover
-          try {
-            await applyMetadataAndCover(audioPath, coverPath, {
-              title, artist, album, year, genre
-            })
-            console.log('Tagged & Downloaded:', audioPath)
-          } catch (tagErr) {
-            console.log(
-              'Tagging / cover error (keeping audio anyway):',
-              tagErr
-            )
-          }
-
-          // the cover jpg is scratch — never let it into the zip
-          if (coverPath) {
-            await fs.promises.unlink(coverPath).catch(() => {})
-          }
-        } catch (err) {
-          console.log('Error downloading:', err)
-        } finally {
-          progress.done++
-        }
+      const results = await yts(query)
+      const video = results.videos[0]
+      if (!video) {
+        track.status = 'failed'
+        track.detail = 'No match on YouTube'
+        console.log('No video found for:', query)
+        continue
       }
 
-      progress.current = ''
-      progress.detail = ''
+      // filename ONLY from title, with spaces (no underscores)
+      const fileBase = makeFileBaseFromTitle(title)
+      const outputTemplate = `${tempFolder}/${fileBase}.%(ext)s`
 
-      // when we're done, reset progress after a little while (optional)
-      setTimeout(() => {
-        progress.total = 0
-        progress.done = 0
-      }, 60_000)
+      // 1) download pure audio
+      track.detail = 'downloading audio'
+      await downloadAudio(video.url, outputTemplate, userQuality, format)
 
-      // Create ZIP to send to user
-      res.setHeader('Content-Type', 'application/zip')
-      res.setHeader('Content-Disposition', 'attachment; filename=songs.zip')
+      const audioPath = findDownloaded(tempFolder, fileBase)
+      if (!audioPath) {
+        track.status = 'failed'
+        track.detail = 'Download produced no file'
+        console.log('Download produced no file for:', query)
+        continue
+      }
 
-      const zip = archiver('zip')
-      zip.pipe(res)
-      zip.directory(tempFolder, false)
-      zip.finalize()
-    })
+      // 2) cover art, then 3) metadata + embed
+      track.detail = 'tagging'
+      const artUrl = await lookupArt(title, artist)
+      const coverPath = await saveArt(artUrl, tempFolder, fileBase)
+
+      try {
+        await applyMetadataAndCover(audioPath, coverPath, {
+          title, artist, album, year, genre
+        })
+        console.log('Tagged & Downloaded:', audioPath)
+      } catch (tagErr) {
+        console.log('Tagging / cover error (keeping audio anyway):', tagErr)
+      }
+
+      // the cover jpg is scratch — never let it into the zip
+      if (coverPath) {
+        await fs.promises.unlink(coverPath).catch(() => {})
+      }
+
+      track.status = 'done'
+      track.detail = probeAudio(audioPath)
+    } catch (err) {
+      track.status = 'failed'
+      track.detail = String(err.message || err).slice(0, 120)
+      console.log('Error downloading:', err)
+    } finally {
+      progress.done++
+    }
+  }
+
+  // when we're done, reset progress after a little while (optional)
+  setTimeout(() => {
+    progress.total = 0
+    progress.done = 0
+    progress.tracks = []
+  }, 60_000)
+
+  // Create ZIP to send to user
+  res.setHeader('Content-Type', 'application/zip')
+  res.setHeader('Content-Disposition', 'attachment; filename=songs.zip')
+
+  const zip = archiver('zip')
+  zip.pipe(res)
+  zip.directory(tempFolder, false)
+  zip.finalize()
 })
 
 if (require.main === module) {

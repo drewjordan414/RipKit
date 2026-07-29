@@ -17,6 +17,8 @@ Tired of streaming algorithms deciding what you should listen to? Tired of losin
   - Writes tags and embeds the cover with `ffmpeg`
 - Zips everything into `songs.zip` for you to download from the browser
 
+Drop a CSV and the page renders your tracklist immediately, cover art and all. Each row then reports its own state as the rip runs — which track is downloading, what codec and bitrate it actually got, and exactly which ones failed and why.
+
 ## Formats
 
 | Format | Re-encoded? | Album art | Notes |
@@ -32,6 +34,7 @@ Tired of streaming algorithms deciding what you should listen to? Tired of losin
 
 ## How it works
 
+- **Preview:** `POST /preview` parses the CSV and looks up cover art on iTunes, so the tracklist can render before any downloading starts
 - **Upload:** the CSV is stored briefly in `uploads/` by `multer`
 - **Search:** `yt-search` finds the best matching YouTube video for each track
 - **Download:** `youtube-dl-exec` (yt-dlp) pulls the best audio-only stream into a temp folder like `mp3s_123456789/`. Unless you pick **Original**, yt-dlp shells out to ffmpeg to transcode into your chosen format.
@@ -87,8 +90,8 @@ node test-formats.js
 
 1. Export your playlist as a CSV — [Chosic](https://www.chosic.com/spotify-playlist-exporter/) does it for Spotify, or use any service that gives you title and artist columns
 2. Open http://localhost:3000
-3. Drop the CSV in, pick a format and bitrate
-4. Watch the wheel fill — it shows the current track and its real codec/bitrate
+3. Drop the CSV in — the tracklist appears with cover art before anything downloads
+4. Pick a format and bitrate, hit rip, and watch each row report its own progress
 5. Your browser downloads `songs.zip` with clean filenames, embedded covers, and tags
 
 ## Stack
