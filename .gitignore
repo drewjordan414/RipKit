@@ -1,5 +1,7 @@
 node_modules/
+dist/
 uploads/
 mp3s_*/
+test_tmp/
 .DS_Store
 .claude/

@@ -1,15 +1,21 @@
 {
-  "name": "zipify-tunes",
-  "version": "1.0.0",
-  "description": "Convert any playlist CSVs into MP3 files with metadata.",
+  "name": "csv-music-downloader",
+  "version": "2.0.0",
+  "description": "Turn a playlist CSV into tagged MP3s with album art.",
   "license": "MIT",
-  "author": "Akhilesh Thite",
+  "author": "drewjordan414",
   "repository": {
     "type": "git",
-    "url": "https://github.com/akhileshthite/zipify-tunes.git"
+    "url": "https://github.com/drewjordan414/csv-music-downloader.git"
   },
   "type": "commonjs",
   "main": "server.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "server": "node server.js",
+    "start": "npm run build && node server.js"
+  },
   "dependencies": {
     "archiver": "^7.0.1",
     "csv-parser": "^3.2.0",
@@ -17,5 +23,11 @@
     "multer": "^2.0.2",
     "youtube-dl-exec": "^3.0.27",
     "yt-search": "^2.13.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "^6.0.7"
   }
 }

@@ -1,15 +1,10 @@
-# ZipifyTunes
+# Rip Kit
 
-Convert any playlist CSV into a local ZIP of MP3 files with **album art** and **metadata** (title, artist, album, year, genre).
-Everything runs **locally** on your machine.
+Turn a playlist CSV into a local ZIP of tagged audio files with **album art** and **metadata** (title, artist, album, year, genre). Everything runs **locally** on your machine.
 
-Tired of streaming algorithms deciding what you should listen to?<br>
-Tired of losing playlists, rising subscription prices, or limited offline access?<br>
-ZipifyTunes lets you take back control; your music, your files, your way.
+Tired of streaming algorithms deciding what you should listen to? Tired of losing playlists, rising subscription prices, or limited offline access? Rip Kit lets you keep your music as files you own.
 
-<div align="left">
-    <img src="./demo.png" width="1000" alt="Screenshot showing ZipifyTunes web interface on PeerSky Browser on the right and the generated MP3 files with album art in Finder on the left.">
-</div>
+![Rip Kit](demo.png)
 
 ## What it does
 
@@ -17,91 +12,92 @@ ZipifyTunes lets you take back control; your music, your files, your way.
 - For each row, it:
   - Reads **title**, **artist**, **album**, **year**, **genre** (from many possible column names)
   - Searches the track on **YouTube**
-  - Downloads the audio as **MP3** using `youtube-dl-exec` / `yt-dlp`
+  - Downloads the audio in the format you picked, using `youtube-dl-exec` / `yt-dlp`
   - Fetches square **album art** from the **iTunes Search API**
-  - Writes **ID3 tags** (title, artist, album, year, genre) and embeds the cover
+  - Writes tags and embeds the cover with `ffmpeg`
 - Zips everything into `songs.zip` for you to download from the browser
+
+## Formats
+
+| Format | Re-encoded? | Album art | Notes |
+| --- | --- | --- | --- |
+| **Original** | No | Source-dependent | Keeps the source stream byte-for-byte. Highest quality available. |
+| **MP3** | Yes | Yes | Plays on everything, including old iPods. ID3v2.3 + ID3v1. |
+| **M4A** | Sometimes | Yes | Apple-native AAC. Often copied straight from the source. |
+| **FLAC** | Yes | Yes | Lossless container — but see the caveat below. |
+| **WAV** | Yes | No | Uncompressed. The container cannot hold cover art. |
+| **OPUS** | Sometimes | No | Smallest at good quality. Newer players only. |
+
+**On "high quality":** the source is a lossy YouTube stream (typically ~130 kbps Opus). Transcoding that to 320 kbps MP3 or FLAC gives you a bigger file, not a better one — you are re-encoding lossy audio a second time. **Original** is the only setting that avoids that, and the app reports the real codec and bitrate of each file as it downloads.
 
 ## How it works
 
-- **Upload:** The CSV you upload is stored briefly in `/uploads/` by `multer` and removed when the process finishes
+- **Upload:** the CSV is stored briefly in `uploads/` by `multer`
 - **Search:** `yt-search` finds the best matching YouTube video for each track
-- **Download:** `youtube-dl-exec` (yt-dlp) downloads and converts audio to MP3 (saved temporarily inside an auto-generated folder like `mp3s_123456789/`)
+- **Download:** `youtube-dl-exec` (yt-dlp) pulls the best audio-only stream into a temp folder like `mp3s_123456789/`. Unless you pick **Original**, yt-dlp shells out to ffmpeg to transcode into your chosen format.
 - **Covers:** iTunes Search API provides square artwork, saved temporarily then embedded
-- **Tagging:** `ffmpeg` writes ID3 tags: title, artist, album, year, genre + embedded cover
-- **Packaging:** `archiver` builds a ZIP of all generated MP3s and streams it back to your browser
+- **Tagging:** a second `ffmpeg` pass (`-c copy`, no re-encode) writes the tags and attaches the cover
+- **Packaging:** `archiver` builds a ZIP and streams it back to your browser
 
 ## Install & run
 
-### node.js
-Make sure you have Node.js installed:
-👉 https://nodejs.org
+### Node.js
+
+https://nodejs.org — version 18 or newer.
 
 ### ffmpeg
-FFmpeg handles audio processing, including embedding album art, writing MP3 metadata (ID3 tags), and packaging the final audio stream without re-encoding. It’s required because yt-dlp only downloads audio. FFmpeg does the tagging, cover embedding, and final MP3 formatting.
 
-macOS (Homebrew):
+ffmpeg does the tagging, cover embedding, and format conversion. `ffprobe` (bundled with it) reports the real bitrate of each download.
+
 ```bash
+# macOS
 brew install ffmpeg
-```
 
-Ubuntu / Debian Linux:
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
+# Ubuntu / Debian
+sudo apt update && sudo apt install ffmpeg
 
-Windows:
-```bash
+# Windows
 winget install Gyan.FFmpeg
 ```
-Manual install: https://www.gyan.dev/ffmpeg/builds/
 
 ### Run
 
 ```bash
-# clone your repo
-git clone https://github.com/akhileshthite/zipify-tunes.git
-cd zipify-tunes
+git clone https://github.com/drewjordan414/csv-music-downloader.git
+cd csv-music-downloader
 
-# install dependencies
 npm install
+npm start          # builds the UI, then serves it at http://localhost:3000
+```
 
-# start the local server
-npm start
+For UI work, run the API and the Vite dev server side by side:
 
-# then open 
-http://localhost:3000
+```bash
+npm run server     # API on :3000
+npm run dev        # UI on :5173 with hot reload, proxying to :3000
+```
+
+Check the format tagging logic without downloading anything:
+
+```bash
+node test-formats.js
 ```
 
 ## How to use
 
-1. Export your playlist as a CSV
-   - You can use tools like https://www.chosic.com/spotify-playlist-exporter/
-   - Or any other service that gives you a CSV with track info
+1. Export your playlist as a CSV — [Chosic](https://www.chosic.com/spotify-playlist-exporter/) does it for Spotify, or use any service that gives you title and artist columns
+2. Open http://localhost:3000
+3. Drop the CSV in, pick a format and bitrate
+4. Watch the wheel fill — it shows the current track and its real codec/bitrate
+5. Your browser downloads `songs.zip` with clean filenames, embedded covers, and tags
 
-2. Open `http://localhost:3000`
+## Stack
 
-3. Choose your CSV file
-
-4. Pick your MP3 quality (128 / 192 / 256 / 320 kbps or “Best”)
-
-5. Click Download MP3s
-
-6. Wait for the progress bar to reach 100%
-
-7. Your browser will download `songs.zip` containing:
-    - MP3s with:
-        - Clean file names
-        - Embedded album cover
-        - Title / Artist / Album / Year / Genre tags
-
-If you want to access your music from anywhere, you can use the [PeerSky Browser](https://github.com/p2plabsxyz/peersky-browser) and upload the generated ZIP from ZipifyTunes to [IPFS](https://docs.ipfs.tech/concepts/what-is-ipfs/) or [Hypercore](https://holepunch.to/). Then you can stream or download your MP3s through [public HTTP gateways](https://ipfs.github.io/public-gateway-checker/) directly on your phone.
+React 19 + Vite on the front, Express 5 on the back, yt-dlp and ffmpeg doing the actual work.
 
 ## Disclaimer
 
-<img src="./ipod.jpg" width="260" align="left" alt="A silver iPod Nano 5th gen showing Cover Flow with album artwork for The Chainsmokers on screen.">
+This tool is intended only for personal, local use.
 
-This tool is intended only for personal, local use:<br>
-- Do not use this project to infringe copyright, redistribute music, or share copyrighted material without permission.<br>
+- Do not use this project to infringe copyright, redistribute music, or share copyrighted material without permission.
 - You are solely responsible for how you use this code and for complying with your local laws and the terms of service of any platforms you access.

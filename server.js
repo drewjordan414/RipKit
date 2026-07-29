@@ -5,16 +5,61 @@ const csv = require('csv-parser')
 const yts = require('yt-search')
 const archiver = require('archiver')
 const youtubedl = require('youtube-dl-exec')
-const { spawn } = require('child_process')
+const { spawn, execFileSync } = require('child_process')
+const path = require('path')
 
 const app = express()
 const upload = multer({ dest: 'uploads/' })
 
-// serve index.html + assets
-app.use(express.static('.'))
+// serve the built React app (npm run build)
+app.use(express.static('dist'))
 
 // simple in-memory progress tracker (single-user / local use)
-const progress = { total: 0, done: 0 }
+const progress = { total: 0, done: 0, current: '', detail: '' }
+
+// what each output format can carry. cover art needs a container that holds a
+// video stream (or FLAC pictures); id3 tags are mp3-only.
+const FORMATS = {
+  mp3: { cover: true, id3: true },
+  m4a: { cover: true, id3: false },
+  flac: { cover: true, id3: false },
+  wav: { cover: false, id3: false },
+  opus: { cover: false, id3: false },
+  webm: { cover: false, id3: false } // only shows up via "original"
+}
+
+// "original" keeps whatever codec the source already used — no re-encode
+const CHOICES = [...Object.keys(FORMATS), 'original']
+
+// user input lands in a filename and an ffmpeg arg — only allow known values
+function normalizeFormat (f) {
+  const key = String(f || '').trim().toLowerCase()
+  return CHOICES.includes(key) ? key : 'mp3'
+}
+
+// "original" means we don't know the extension until yt-dlp has written the file
+function findDownloaded (folder, fileBase) {
+  const hit = fs
+    .readdirSync(folder)
+    .find((f) => f.startsWith(fileBase + '.') && !f.includes('.tagged.'))
+  return hit ? `${folder}/${hit}` : null
+}
+
+// what ffmpeg actually produced, so we can report real quality instead of the request
+function probeAudio (file) {
+  try {
+    const out = execFileSync('ffprobe', [
+      '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', file
+    ])
+    const info = JSON.parse(out)
+    const audio = info.streams.find((s) => s.codec_type === 'audio')
+    if (!audio) return ''
+    const kbps = Math.round((audio.bit_rate || info.format.bit_rate || 0) / 1000)
+    return kbps ? `${audio.codec_name} · ${kbps} kbps` : audio.codec_name
+  } catch {
+    return ''
+  }
+}
 
 // normalize user-entered quality (e.g. "128" -> "128K", "best" -> "0")
 function normalizeQuality (q) {
@@ -103,18 +148,27 @@ function getGenre (row) {
   ])
 }
 
-// 1) Download MP3 audio only (no metadata, no thumbnail)
-function downloadMP3 (url, outputTemplate, userQuality) {
+// 1) Download audio only (no metadata, no thumbnail)
+function downloadAudio (url, outputTemplate, userQuality, format) {
   const audioQuality = normalizeQuality(userQuality)
 
-  return youtubedl(url, {
+  const opts = {
     extractAudio: true, // -x / --extract-audio
-    audioFormat: 'mp3', // --audio-format mp3
-    audioQuality, // --audio-quality (0-10 or "128K" etc)
     noPlaylist: true, // --no-playlist
     output: outputTemplate // -o "<folder>/<file>.%(ext)s"
     // NOTE: no embedThumbnail / addMetadata here
-  })
+  }
+
+  if (format === 'original') {
+    // best audio stream, container remuxed but codec untouched — no second
+    // lossy generation. This is the highest quality the source can give.
+    opts.format = 'bestaudio/best'
+  } else {
+    opts.audioFormat = format // --audio-format mp3 / m4a / flac / …
+    opts.audioQuality = audioQuality // --audio-quality (0-10 or "128K" etc)
+  }
+
+  return youtubedl(url, opts)
 }
 
 // 2) Fetch album art from iTunes (square) and save as JPG
@@ -164,10 +218,16 @@ async function fetchAlbumArt (title, artist, tempFolder, fileBase) {
 }
 
 // 3) Use ffmpeg to apply metadata + optional cover art
-function applyMetadataAndCover (mp3Path, coverPath, meta) {
+function applyMetadataAndCover (audioPath, coverPath, meta) {
   return new Promise((resolve, reject) => {
-    // Make sure the temp file still ends in .mp3 so ffmpeg knows the format
-    const tempOut = mp3Path.replace(/\.mp3$/i, '.tagged.mp3')
+    // trust the file on disk, not the requested format — "original" only
+    // learns its container once yt-dlp has written it
+    const ext = path.extname(audioPath).slice(1).toLowerCase()
+    const caps = FORMATS[ext] || { cover: false, id3: false }
+    const embedCover = Boolean(coverPath) && caps.cover
+
+    // Keep the extension so ffmpeg still picks the right muxer
+    const tempOut = audioPath.replace(new RegExp(`\\.${ext}$`, 'i'), `.tagged.${ext}`)
 
     const args = []
 
@@ -175,13 +235,13 @@ function applyMetadataAndCover (mp3Path, coverPath, meta) {
     args.push('-y')
 
     // INPUTS
-    args.push('-i', mp3Path) // audio
-    if (coverPath) {
+    args.push('-i', audioPath) // audio
+    if (embedCover) {
       args.push('-i', coverPath) // cover image
     }
 
     // MAPS
-    if (coverPath) {
+    if (embedCover) {
       // map audio & image
       args.push('-map', '0:a')
       args.push('-map', '1:v')
@@ -192,9 +252,11 @@ function applyMetadataAndCover (mp3Path, coverPath, meta) {
     // copy streams, don't re-encode
     args.push('-c', 'copy')
 
-    // ensure proper ID3v2 + write ID3v1 for older players/iPods
-    args.push('-id3v2_version', '3')
-    args.push('-write_id3v1', '1')
+    if (caps.id3) {
+      // ensure proper ID3v2 + write ID3v1 for older players/iPods
+      args.push('-id3v2_version', '3')
+      args.push('-write_id3v1', '1')
+    }
 
     // metadata from CSV
     if (meta.title) args.push('-metadata', `title=${meta.title}`)
@@ -203,12 +265,14 @@ function applyMetadataAndCover (mp3Path, coverPath, meta) {
     if (meta.genre) args.push('-metadata', `genre=${meta.genre}`)
 
     if (meta.year) {
-      // keep it simple: standard "year" field for ID3v2.3
-      args.push('-metadata', `year=${meta.year}`)
+      // "year" is the ID3v2.3 field; "date" is what mp4/vorbis containers read
+      if (caps.id3) args.push('-metadata', `year=${meta.year}`)
+      args.push('-metadata', `date=${meta.year}`)
     }
 
     // extra tags for cover
-    if (coverPath) {
+    if (embedCover) {
+      args.push('-disposition:v', 'attached_pic')
       args.push('-metadata:s:v', 'title=Album cover')
       args.push('-metadata:s:v', 'comment=Cover (front)')
     }
@@ -226,20 +290,7 @@ function applyMetadataAndCover (mp3Path, coverPath, meta) {
     ff.on('close', (code) => {
       if (code === 0) {
         // Replace original file with tagged version
-        fs.promises
-          .rename(tempOut, mp3Path)
-          .then(async () => {
-            // clean up cover file once we've embedded it
-            if (coverPath) {
-              try {
-                await fs.promises.unlink(coverPath)
-              } catch (e) {
-                // ignore delete errors
-              }
-            }
-            resolve()
-          })
-          .catch(reject)
+        fs.promises.rename(tempOut, audioPath).then(resolve).catch(reject)
       } else {
         // clean up temp on error
         fs.promises
@@ -265,6 +316,7 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   const csvPath = req.file.path
   const songs = []
   const userQuality = req.body.quality || '0'
+  const format = normalizeFormat(req.body.format)
 
   fs.createReadStream(csvPath)
     .pipe(csv())
@@ -275,6 +327,8 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
       progress.total = songs.length
       progress.done = 0
+      progress.current = ''
+      progress.detail = ''
 
       for (const s of songs) {
         try {
@@ -329,6 +383,8 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
           }
 
           const query = `${title} ${artist}`
+          progress.current = query
+          progress.detail = ''
           console.log('Searching:', query)
 
           const results = await yts(query)
@@ -342,12 +398,18 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
           // filename ONLY from title, with spaces (no underscores)
           const fileBase = makeFileBaseFromTitle(title)
 
-          // yt-dlp will write "<fileBase>.mp3"
+          // yt-dlp will write "<fileBase>.<ext>"
           const outputTemplate = `${tempFolder}/${fileBase}.%(ext)s`
-          const mp3Path = `${tempFolder}/${fileBase}.mp3`
 
           // 1) download pure audio
-          await downloadMP3(video.url, outputTemplate, userQuality)
+          await downloadAudio(video.url, outputTemplate, userQuality, format)
+
+          const audioPath = findDownloaded(tempFolder, fileBase)
+          if (!audioPath) {
+            console.log('Download produced no file for:', query)
+            continue
+          }
+          progress.detail = probeAudio(audioPath)
 
           // 2) fetch nice square album art (movie/album style)
           const coverPath = await fetchAlbumArt(
@@ -359,19 +421,20 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
           // 3) apply metadata from CSV + embed cover
           try {
-            await applyMetadataAndCover(mp3Path, coverPath, {
-              title,
-              artist,
-              album,
-              year,
-              genre
+            await applyMetadataAndCover(audioPath, coverPath, {
+              title, artist, album, year, genre
             })
-            console.log('Tagged & Downloaded:', mp3Path)
+            console.log('Tagged & Downloaded:', audioPath)
           } catch (tagErr) {
             console.log(
               'Tagging / cover error (keeping audio anyway):',
               tagErr
             )
+          }
+
+          // the cover jpg is scratch — never let it into the zip
+          if (coverPath) {
+            await fs.promises.unlink(coverPath).catch(() => {})
           }
         } catch (err) {
           console.log('Error downloading:', err)
@@ -379,6 +442,9 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
           progress.done++
         }
       }
+
+      progress.current = ''
+      progress.detail = ''
 
       // when we're done, reset progress after a little while (optional)
       setTimeout(() => {
@@ -397,4 +463,8 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
     })
 })
 
-app.listen(3000, () => console.log('Server running at http://localhost:3000'))
+if (require.main === module) {
+  app.listen(3000, () => console.log('Server running at http://localhost:3000'))
+}
+
+module.exports = { FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover }
