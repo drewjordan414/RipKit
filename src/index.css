@@ -249,6 +249,13 @@ a { color: inherit; }
   gap: 16px;
   padding: 12px 4px;
   border-bottom: 1px solid rgb(255 255 255 / 0.14);
+  /* each batch deals itself in, top to bottom */
+  animation: deal 0.32s ease-out backwards;
+  animation-delay: calc(var(--i, 0) * 22ms);
+}
+
+@keyframes deal {
+  from { opacity: 0; transform: translateY(8px); }
 }
 
 .track.is-skipped { opacity: 0.4; }
@@ -351,6 +358,32 @@ a { color: inherit; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── see more ─────────────────────────────────────── */
+.more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid rgb(255 255 255 / 0.25);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--bone);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.more:hover {
+  background: rgb(255 255 255 / 0.08);
+  border-color: rgb(255 255 255 / 0.5);
+}
+
+.more__count { opacity: 0.5; }
+
 /* ── footer ───────────────────────────────────────── */
 footer {
   display: flex;
@@ -378,6 +411,7 @@ footer {
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+  .track { animation: none; }
   .track__spinner { animation: none; border-top-color: rgb(255 255 255 / 0.25); }
   .is-working .track__status::after { content: '·'; }
 }

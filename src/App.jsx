@@ -22,12 +22,15 @@ const BITRATE_OK = ['mp3', 'm4a', 'opus']
 
 const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–' }
 
+// how many rows land at a time
+const PAGE = 25
+
 function Track ({ track, index }) {
   const { title, artist, album, year, art, status, detail } = track
   const meta = [album, year].filter(Boolean).join(' · ')
 
   return (
-    <li className={`track is-${status}`}>
+    <li className={`track is-${status}`} style={{ '--i': index % PAGE }}>
       <div className='track__art'>
         {art
           ? <img src={art} alt='' loading='lazy' />
@@ -65,11 +68,19 @@ export default function App () {
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState('')
+  const [shown, setShown] = useState(PAGE)
   const inputRef = useRef(null)
 
   const noBitrate = !BITRATE_OK.includes(format)
   const done = tracks.filter((t) => t.status === 'done').length
   const failed = tracks.filter((t) => t.status === 'failed' || t.status === 'skipped').length
+  const working = tracks.findIndex((t) => t.status === 'working')
+  const remaining = tracks.length - shown
+
+  // ponytail: while ripping, let the list follow the work rather than hide it
+  useEffect(() => {
+    if (busy && working >= shown) setShown(Math.ceil((working + 1) / PAGE) * PAGE)
+  }, [busy, working, shown])
 
   useEffect(() => {
     if (!busy) return
@@ -96,6 +107,7 @@ export default function App () {
     setError('')
     setFile(f)
     setTracks([])
+    setShown(PAGE)
     setReading(true)
 
     try {
@@ -147,6 +159,7 @@ export default function App () {
   const reset = () => {
     setFile(null)
     setTracks([])
+    setShown(PAGE)
     setError('')
     if (inputRef.current) inputRef.current.value = ''
   }
@@ -267,8 +280,15 @@ export default function App () {
           </section>
 
           <ol className='tracklist'>
-            {tracks.map((t, i) => <Track key={i} track={t} index={i} />)}
+            {tracks.slice(0, shown).map((t, i) => <Track key={i} track={t} index={i} />)}
           </ol>
+
+          {remaining > 0 && (
+            <button className='more' onClick={() => setShown((s) => s + PAGE)}>
+              See {Math.min(PAGE, remaining)} more
+              <span className='more__count'>{remaining} left</span>
+            </button>
+          )}
         </>
       )}
 
