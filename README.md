@@ -17,7 +17,7 @@ Tired of streaming algorithms deciding what you should listen to? Tired of losin
   - Writes tags and embeds the cover with `ffmpeg`
 - Zips everything into `songs.zip` for you to download from the browser
 
-Drop a CSV and the page renders your tracklist immediately, cover art and all. Each row then reports its own state as the rip runs — which track is downloading, what codec and bitrate it actually got, and exactly which ones failed and why.
+Drop a CSV and the page renders your tracklist immediately, cover art and all. Once a rip starts, the track being worked on gets promoted to its own panel — full-size album art with yt-dlp's real download percentage running across it. Finished tracks stack up underneath, newest first, each showing the codec and bitrate it actually got or the reason it failed. Long playlists load 25 rows at a time.
 
 ## Formats
 

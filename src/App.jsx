@@ -25,16 +25,54 @@ const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–' }
 // how many rows land at a time
 const PAGE = 25
 
-function Track ({ track, index }) {
+function Cover ({ art, className = '' }) {
+  return art
+    ? <img className={className} src={art} alt='' loading='lazy' />
+    : <span className={`${className} cover--empty`} aria-hidden='true' />
+}
+
+// The track being worked on right now: full-size art with the bar across it.
+function NowRipping ({ track, position, total }) {
+  const { title, artist, album, year, art, detail, percent = 0 } = track
+
+  return (
+    <section className='now'>
+      <div className='now__art'>
+        <Cover art={art} className='now__img' />
+        <div
+          className='now__bar'
+          role='progressbar'
+          aria-valuenow={percent}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <span style={{ width: `${percent}%` }} />
+        </div>
+      </div>
+
+      <div className='now__text'>
+        <span className='now__eyebrow'>Ripping {position} of {total}</span>
+        <h2 className='now__title'>{title}</h2>
+        <span className='now__artist'>{artist}</span>
+        <span className='now__album'>{[album, year].filter(Boolean).join(' · ')}</span>
+      </div>
+
+      <div className='now__readout'>
+        <span className='now__pct'>{percent}<i>%</i></span>
+        <span className='now__phase'>{detail}</span>
+      </div>
+    </section>
+  )
+}
+
+function Track ({ track, index, order }) {
   const { title, artist, album, year, art, status, detail } = track
   const meta = [album, year].filter(Boolean).join(' · ')
 
   return (
-    <li className={`track is-${status}`} style={{ '--i': index % PAGE }}>
+    <li className={`track is-${status}`} style={{ '--i': order % PAGE }}>
       <div className='track__art'>
-        {art
-          ? <img src={art} alt='' loading='lazy' />
-          : <span className='track__art--empty' aria-hidden='true' />}
+        <Cover art={art} className='track__img' />
       </div>
 
       <span className='track__n'>{String(index + 1).padStart(2, '0')}</span>
@@ -45,17 +83,39 @@ function Track ({ track, index }) {
       </div>
 
       <div className='track__meta'>
-        {status === 'working' || status === 'failed' || (status === 'done' && detail)
+        {detail
           ? <span className='track__detail'>{detail}</span>
           : <span className='track__album'>{meta}</span>}
       </div>
 
       <span className='track__status' title={status}>
-        {status === 'working'
-          ? <span className='track__spinner' aria-label='working' />
-          : (STATUS_MARK[status] || '·')}
+        {STATUS_MARK[status] || '·'}
       </span>
     </li>
+  )
+}
+
+function Stack ({ items, shown, onMore, label, count }) {
+  const remaining = items.length - shown
+  return (
+    <>
+      {label && (
+        <h3 className='stack__head'>
+          {label}<span>{count ?? items.length}</span>
+        </h3>
+      )}
+      <ol className='tracklist'>
+        {items.slice(0, shown).map(({ track, index }, order) => (
+          <Track key={index} track={track} index={index} order={order} />
+        ))}
+      </ol>
+      {remaining > 0 && (
+        <button className='more' onClick={onMore}>
+          See {Math.min(PAGE, remaining)} more
+          <span className='more__count'>{remaining} left</span>
+        </button>
+      )}
+    </>
   )
 }
 
@@ -68,19 +128,21 @@ export default function App () {
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState('')
-  const [shown, setShown] = useState(PAGE)
+  const [shownDone, setShownDone] = useState(PAGE)
+  const [shownQueue, setShownQueue] = useState(PAGE)
   const inputRef = useRef(null)
 
   const noBitrate = !BITRATE_OK.includes(format)
+
+  const indexed = tracks.map((track, index) => ({ track, index }))
+  const activeIdx = tracks.findIndex((t) => t.status === 'working')
+  const active = activeIdx >= 0 ? tracks[activeIdx] : null
+  // newest first, so a finished track lands directly under the one ripping
+  const finished = indexed.filter(({ track }) => track.status === 'done' || track.status === 'failed').reverse()
+  const queued = indexed.filter(({ track }) => track.status === 'queued' || track.status === 'skipped')
+
   const done = tracks.filter((t) => t.status === 'done').length
   const failed = tracks.filter((t) => t.status === 'failed' || t.status === 'skipped').length
-  const working = tracks.findIndex((t) => t.status === 'working')
-  const remaining = tracks.length - shown
-
-  // ponytail: while ripping, let the list follow the work rather than hide it
-  useEffect(() => {
-    if (busy && working >= shown) setShown(Math.ceil((working + 1) / PAGE) * PAGE)
-  }, [busy, working, shown])
 
   useEffect(() => {
     if (!busy) return
@@ -93,7 +155,7 @@ export default function App () {
         // the server only reports status; titles and art stay client-side
         setTracks((prev) => prev.map((t, i) => ({ ...t, ...(data.tracks[i] || {}) })))
       } catch { /* server is mid-rip; next tick retries */ }
-    }, 1000)
+    }, 700)
     return () => clearInterval(id)
   }, [busy])
 
@@ -107,7 +169,8 @@ export default function App () {
     setError('')
     setFile(f)
     setTracks([])
-    setShown(PAGE)
+    setShownDone(PAGE)
+    setShownQueue(PAGE)
     setReading(true)
 
     try {
@@ -130,8 +193,10 @@ export default function App () {
     if (!file || busy) return
     setBusy(true)
     setError('')
+    setShownDone(PAGE)
+    setShownQueue(PAGE)
     setTracks((prev) => prev.map((t) => (
-      t.status === 'skipped' ? t : { ...t, status: 'queued', detail: '' }
+      t.status === 'skipped' ? t : { ...t, status: 'queued', detail: '', percent: 0 }
     )))
 
     const body = new FormData()
@@ -159,12 +224,14 @@ export default function App () {
   const reset = () => {
     setFile(null)
     setTracks([])
-    setShown(PAGE)
+    setShownDone(PAGE)
+    setShownQueue(PAGE)
     setError('')
     if (inputRef.current) inputRef.current.value = ''
   }
 
   const loaded = tracks.length > 0
+  const started = busy || finished.length > 0
 
   return (
     <main className={`page${loaded ? ' is-loaded' : ''}`}>
@@ -225,7 +292,7 @@ export default function App () {
       {loaded && (
         <>
           <section className='bar'>
-            <fieldset className='pills'>
+            <fieldset className='pills' disabled={busy}>
               <legend>Format</legend>
               <div className='pills__row'>
                 {FORMATS.map((f) => (
@@ -234,7 +301,6 @@ export default function App () {
                     type='button'
                     className={format === f.value ? 'is-on' : ''}
                     aria-pressed={format === f.value}
-                    disabled={busy}
                     onClick={() => setFormat(f.value)}
                   >
                     {f.label}
@@ -272,22 +338,39 @@ export default function App () {
 
             <button className='go' onClick={rip} disabled={busy}>
               {busy
-                ? `Ripping ${done + 1} of ${tracks.length}…`
+                ? `Ripping ${done + failed + 1} of ${tracks.length}…`
                 : format === 'original'
                   ? 'Rip at source quality'
                   : `Rip to ${format.toUpperCase()}`}
             </button>
           </section>
 
-          <ol className='tracklist'>
-            {tracks.slice(0, shown).map((t, i) => <Track key={i} track={t} index={i} />)}
-          </ol>
+          {active && (
+            <NowRipping
+              track={active}
+              position={activeIdx + 1}
+              total={tracks.length}
+            />
+          )}
 
-          {remaining > 0 && (
-            <button className='more' onClick={() => setShown((s) => s + PAGE)}>
-              See {Math.min(PAGE, remaining)} more
-              <span className='more__count'>{remaining} left</span>
-            </button>
+          {finished.length > 0 && (
+            <Stack
+              items={finished}
+              shown={shownDone}
+              onMore={() => setShownDone((s) => s + PAGE)}
+              label='Finished'
+              count={finished.length}
+            />
+          )}
+
+          {queued.length > 0 && (
+            <Stack
+              items={queued}
+              shown={shownQueue}
+              onMore={() => setShownQueue((s) => s + PAGE)}
+              label={started ? 'Up next' : null}
+              count={queued.length}
+            />
           )}
         </>
       )}

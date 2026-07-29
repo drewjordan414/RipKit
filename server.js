@@ -148,14 +148,17 @@ function getGenre (row) {
   ])
 }
 
-// 1) Download audio only (no metadata, no thumbnail)
-function downloadAudio (url, outputTemplate, userQuality, format) {
+// 1) Download audio only (no metadata, no thumbnail).
+// onPercent gets yt-dlp's real download percentage as it streams.
+function downloadAudio (url, outputTemplate, userQuality, format, onPercent) {
   const audioQuality = normalizeQuality(userQuality)
 
   const opts = {
     extractAudio: true, // -x / --extract-audio
     noPlaylist: true, // --no-playlist
-    output: outputTemplate // -o "<folder>/<file>.%(ext)s"
+    output: outputTemplate, // -o "<folder>/<file>.%(ext)s"
+    newline: true, // --newline: one progress line per update, not \r
+    progress: true // --progress: report even though this is not a tty
     // NOTE: no embedThumbnail / addMetadata here
   }
 
@@ -168,7 +171,23 @@ function downloadAudio (url, outputTemplate, userQuality, format) {
     opts.audioQuality = audioQuality // --audio-quality (0-10 or "128K" etc)
   }
 
-  return youtubedl(url, opts)
+  const sub = youtubedl.exec(url, opts)
+
+  sub.stdout?.on('data', (chunk) => {
+    const pct = parseProgress(chunk)
+    if (pct !== null) onPercent(pct)
+  })
+
+  return sub
+}
+
+// yt-dlp writes "[download]  45.2% of ~3.50MiB at 1.20MiB/s ETA 00:02".
+// A chunk can hold several updates — only the last one is current.
+function parseProgress (chunk) {
+  const hits = String(chunk).match(/\[download\]\s+([\d.]+)%/g)
+  if (!hits) return null
+  const pct = parseFloat(hits[hits.length - 1].match(/([\d.]+)%/)[1])
+  return Number.isNaN(pct) ? null : pct
 }
 
 // 2a) Ask iTunes for a square cover URL. Cheap enough to run before a rip so
@@ -384,7 +403,8 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   progress.done = 0
   progress.tracks = songs.map((s) => ({
     status: s.title && s.artist ? 'queued' : 'skipped',
-    detail: s.title && s.artist ? '' : 'No title or artist in this row'
+    detail: s.title && s.artist ? '' : 'No title or artist in this row',
+    percent: 0
   }))
 
   for (const [i, s] of songs.entries()) {
@@ -399,6 +419,7 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
     track.status = 'working'
     track.detail = 'searching youtube'
+    track.percent = 0
 
     try {
       const query = `${title} ${artist}`
@@ -417,9 +438,12 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       const fileBase = makeFileBaseFromTitle(title)
       const outputTemplate = `${tempFolder}/${fileBase}.%(ext)s`
 
-      // 1) download pure audio
+      // 1) download pure audio. The download is the long part, so it owns
+      // most of the bar; tagging tops off the rest.
       track.detail = 'downloading audio'
-      await downloadAudio(video.url, outputTemplate, userQuality, format)
+      await downloadAudio(video.url, outputTemplate, userQuality, format, (pct) => {
+        track.percent = Math.round(pct * 0.9)
+      })
 
       const audioPath = findDownloaded(tempFolder, fileBase)
       if (!audioPath) {
@@ -431,6 +455,7 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
       // 2) cover art, then 3) metadata + embed
       track.detail = 'tagging'
+      track.percent = 95
       const artUrl = await lookupArt(title, artist)
       const coverPath = await saveArt(artUrl, tempFolder, fileBase)
 
@@ -450,6 +475,7 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
       track.status = 'done'
       track.detail = probeAudio(audioPath)
+      track.percent = 100
     } catch (err) {
       track.status = 'failed'
       track.detail = String(err.message || err).slice(0, 120)
@@ -480,4 +506,6 @@ if (require.main === module) {
   app.listen(3000, () => console.log('Server running at http://localhost:3000'))
 }
 
-module.exports = { FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover }
+module.exports = {
+  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress
+}

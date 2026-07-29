@@ -5,7 +5,10 @@
 const assert = require('assert')
 const fs = require('fs')
 const { execFileSync } = require('child_process')
-const { FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover } = require('./server')
+const ytdl = require('youtube-dl-exec')
+const {
+  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress
+} = require('./server')
 
 const DIR = 'test_tmp'
 const META = { title: 'Test Track', artist: 'Test Artist', album: 'Test Album', year: '1999', genre: 'Rock' }
@@ -24,6 +27,21 @@ async function main () {
   assert.equal(normalizeFormat(undefined), 'mp3')
   assert.equal(normalizeQuality('128'), '128K')
   assert.equal(normalizeQuality('best'), '0')
+
+  // progress parsing: the bar is only as honest as this regex
+  assert.equal(parseProgress('[download]  45.2% of ~3.50MiB at 1.20MiB/s ETA 00:02'), 45.2)
+  assert.equal(parseProgress('[download]   0.0% of 3.50MiB'), 0)
+  assert.equal(parseProgress('[download] 100% of 3.50MiB in 00:03'), 100)
+  // several updates in one chunk — the newest wins
+  assert.equal(parseProgress('[download]  10.0% of 1MiB\n[download]  72.5% of 1MiB\n'), 72.5)
+  assert.equal(parseProgress('[ExtractAudio] Destination: song.mp3'), null)
+  assert.equal(parseProgress(''), null)
+
+  // the flags the progress stream depends on must survive dargs
+  const flags = ytdl.args({ newline: true, progress: true, extractAudio: true, audioFormat: 'mp3' })
+  assert.ok(flags.includes('--newline'), `--newline missing from ${flags}`)
+  assert.ok(flags.includes('--progress'), `--progress missing from ${flags}`)
+  assert.ok(flags.includes('--extract-audio'), `--extract-audio missing from ${flags}`)
 
   fs.rmSync(DIR, { recursive: true, force: true })
   fs.mkdirSync(DIR)
