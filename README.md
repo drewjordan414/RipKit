@@ -12,7 +12,7 @@ Tired of streaming algorithms deciding what you should listen to? Tired of losin
 - For each row, it:
   - Reads **title**, **artist**, **album**, **year**, **genre** (from many possible column names)
   - Searches the track on **YouTube**
-  - Downloads the audio in the format you picked, using `youtube-dl-exec` / `yt-dlp`
+  - Downloads the audio using `youtube-dl-exec` / `yt-dlp`, keeping the source stream untouched unless you asked for MP3
   - Fetches square **album art** from the **iTunes Search API**
   - Writes tags and embeds the cover with `ffmpeg`
 - Zips everything into `songs.zip` for you to download from the browser
@@ -21,16 +21,25 @@ Drop a CSV and the page renders your tracklist immediately, cover art and all. O
 
 ## Formats
 
-| Format | Re-encoded? | Album art | Notes |
-| --- | --- | --- | --- |
-| **Original** | No | Source-dependent | Keeps the source stream byte-for-byte. Highest quality available. |
-| **MP3** | Yes | Yes | Plays on everything, including old iPods. ID3v2.3 + ID3v1. |
-| **M4A** | Sometimes | Yes | Apple-native AAC. Often copied straight from the source. |
-| **FLAC** | Yes | Yes | Lossless container — but see the caveat below. |
-| **WAV** | Yes | No | Uncompressed. The container cannot hold cover art. |
-| **OPUS** | Sometimes | No | Smallest at good quality. Newer players only. |
+There are two, on purpose.
 
-**On "high quality":** the source is a lossy YouTube stream (typically ~130 kbps Opus). Transcoding that to 320 kbps MP3 or FLAC gives you a bigger file, not a better one — you are re-encoding lossy audio a second time. **Original** is the only setting that avoids that, and the app reports the real codec and bitrate of each file as it downloads.
+| Format | Re-encoded? | Album art | Why it exists |
+| --- | --- | --- | --- |
+| **Original** (default) | No | Source-dependent | Keeps the source stream exactly as it arrived, usually Opus or AAC. Nothing beats it for quality. |
+| **MP3** | Yes | Yes | Loses a little, but plays on hardware that cannot read Opus or AAC — old iPods, car stereos, cheap DAPs. ID3v2.3 + ID3v1. |
+
+MP3 offers three bitrates: **Best** (VBR, ~245 kbps), **192k**, and **128k**. The lower two trade quality for space, which is a real choice. Rates above VBR-best are not offered, because they only pad the file.
+
+**Why FLAC, WAV, M4A and OPUS were removed.** The source is always a lossy stream, so re-encoding it can only lose data. Measured against a 387 kbps AAC source:
+
+| | Result | vs source |
+| --- | --- | --- |
+| FLAC | 2942 kbps | 7.6× the bitrate, bit-identical audio content |
+| WAV | 4608 kbps | 11.9× the bitrate, bit-identical audio content |
+| M4A | 386 kbps | same size, second generation of loss |
+| OPUS | 270 kbps | no size win, worse compatibility than MP3 |
+
+A lossless container around already-compressed audio does not recover anything — it just stores the damage at a higher bitrate. The app reports the real codec and bitrate of every file as it downloads, so you can check this yourself.
 
 ## How it works
 

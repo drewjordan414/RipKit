@@ -1,24 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 
+// Higher bitrates than the source cannot add back what the source never had —
+// they only make the file bigger. VBR lets the encoder track the material; the
+// lower rates are here for when you want the space back and accept the cost.
 const QUALITIES = [
-  { value: '0', label: 'Best' },
-  { value: '128', label: '128k' },
-  { value: '192', label: '192k' },
-  { value: '256', label: '256k' },
-  { value: '320', label: '320k' }
+  { value: '0', label: 'Best', note: 'Variable bitrate, around 245k. Tracks the material instead of padding quiet passages.' },
+  { value: '192', label: '192k', note: 'Smaller files, a little quality given up on dense material.' },
+  { value: '128', label: '128k', note: 'Smallest. Audibly lossy — pick this only when space matters more than sound.' }
 ]
 
 const FORMATS = [
-  { value: 'original', label: 'ORIGINAL', note: 'No re-encode. Keeps the source stream exactly as it came — the best quality available, usually Opus or AAC.' },
-  { value: 'mp3', label: 'MP3', note: 'Plays on everything. Keeps album art.' },
-  { value: 'm4a', label: 'M4A', note: 'Apple-native AAC. Often copied straight from the source, no second re-encode.' },
-  { value: 'flac', label: 'FLAC', note: 'Lossless container around an already-compressed source. Bigger files, no quality gained.' },
-  { value: 'wav', label: 'WAV', note: 'Uncompressed. No album art — the format cannot hold one.' },
-  { value: 'opus', label: 'OPUS', note: 'Smallest at good quality. No album art. Newer players only.' }
+  { value: 'original', label: 'ORIGINAL', note: 'No re-encode. Keeps the source stream exactly as it arrived — usually Opus or AAC. Nothing here can beat it for quality.' },
+  { value: 'mp3', label: 'MP3', note: 'Re-encodes, so it loses a little. Worth it only if your player cannot read Opus or AAC — old iPods, car stereos, cheap DAPs.' }
 ]
 
-// bitrate only means something when we are actually re-encoding to a lossy codec
-const BITRATE_OK = ['mp3', 'm4a', 'opus']
+// bitrate only means something when we are actually re-encoding
+const BITRATE_OK = ['mp3']
 
 const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–' }
 
@@ -123,7 +120,7 @@ export default function App () {
   const [file, setFile] = useState(null)
   const [tracks, setTracks] = useState([])
   const [quality, setQuality] = useState('0')
-  const [format, setFormat] = useState('mp3')
+  const [format, setFormat] = useState('original')
   const [busy, setBusy] = useState(false)
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -327,13 +324,11 @@ export default function App () {
                   </button>
                 ))}
               </div>
-              {noBitrate && (
-                <p className='pills__note'>
-                  {format === 'original'
-                    ? 'Nothing gets re-encoded, so there is no bitrate to set.'
-                    : `${format.toUpperCase()} stores every sample, so there is no bitrate to set.`}
-                </p>
-              )}
+              <p className='pills__note'>
+                {noBitrate
+                  ? 'Nothing gets re-encoded, so there is no bitrate to set.'
+                  : QUALITIES.find((q) => q.value === quality).note}
+              </p>
             </fieldset>
 
             <button className='go' onClick={rip} disabled={busy}>

@@ -22,9 +22,14 @@ function ffprobe (file) {
 
 async function main () {
   // pure functions first
-  assert.equal(normalizeFormat('FLAC'), 'flac')
-  assert.equal(normalizeFormat('../../etc/passwd'), 'mp3', 'unknown format must fall back, not pass through')
-  assert.equal(normalizeFormat(undefined), 'mp3')
+  assert.equal(normalizeFormat('MP3'), 'mp3')
+  assert.equal(normalizeFormat('original'), 'original')
+  assert.equal(normalizeFormat('../../etc/passwd'), 'original', 'unknown format must fall back, not pass through')
+  assert.equal(normalizeFormat(undefined), 'original')
+  // formats we deliberately stopped offering must not sneak back in via the API
+  for (const dropped of ['flac', 'wav', 'm4a', 'opus']) {
+    assert.equal(normalizeFormat(dropped), 'original', `${dropped} is no longer a conversion target`)
+  }
   assert.equal(normalizeQuality('128'), '128K')
   assert.equal(normalizeQuality('best'), '0')
 

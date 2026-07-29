@@ -17,24 +17,33 @@ app.use(express.static('dist'))
 // simple in-memory progress tracker (single-user / local use)
 const progress = { total: 0, done: 0, tracks: [] }
 
-// what each output format can carry. cover art needs a container that holds a
-// video stream (or FLAC pictures); id3 tags are mp3-only.
+// What each container can carry, for tagging. This covers more formats than
+// we offer as conversion targets, because "original" hands back whatever
+// codec the source used — usually opus or m4a, occasionally webm.
 const FORMATS = {
   mp3: { cover: true, id3: true },
   m4a: { cover: true, id3: false },
   flac: { cover: true, id3: false },
   wav: { cover: false, id3: false },
   opus: { cover: false, id3: false },
-  webm: { cover: false, id3: false } // only shows up via "original"
+  webm: { cover: false, id3: false }
 }
 
-// "original" keeps whatever codec the source already used — no re-encode
-const CHOICES = [...Object.keys(FORMATS), 'original']
+// What a user may actually pick.
+//
+// The source is always a lossy stream, so re-encoding it can only lose data.
+// Measured against a 387 kbps AAC source: flac came back at 2942 kbps and wav
+// at 4608 kbps — 7.6x and 11.9x the bitrate for bit-identical audio content.
+// m4a and opus re-encode to roughly the source's own size while adding a
+// second generation of loss, which is strictly worse than keeping the
+// original. That leaves two honest choices: keep the source as-is, or convert
+// to mp3 because your player cannot read opus or aac.
+const CHOICES = ['original', 'mp3']
 
 // user input lands in a filename and an ffmpeg arg — only allow known values
 function normalizeFormat (f) {
   const key = String(f || '').trim().toLowerCase()
-  return CHOICES.includes(key) ? key : 'mp3'
+  return CHOICES.includes(key) ? key : 'original'
 }
 
 // "original" means we don't know the extension until yt-dlp has written the file
