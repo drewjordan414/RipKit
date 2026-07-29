@@ -5,10 +5,11 @@
 const assert = require('assert')
 const fs = require('fs')
 const { execFileSync } = require('child_process')
+const pathmod = require('path')
 const ytdl = require('youtube-dl-exec')
 const {
   FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
-  toTrack
+  toTrack, resolveDest
 } = require('./server')
 
 const DIR = 'test_tmp'
@@ -68,6 +69,24 @@ async function main () {
   assert.equal(toTrack({ Title: 'x', Artist: 'y', Year: '1994' }).year, '1994')
   // a row with no usable columns stays empty rather than inventing something
   assert.equal(toTrack({ ISRC: 'USRC12600729', Type: 'Favorite' }).title, '')
+
+  // Destination folder: browser input that becomes a real path. Anything that
+  // escapes the download root must be refused or flattened, never written to.
+  const root = resolveDest('')
+  assert.ok(pathmod.isAbsolute(root), 'download root must be absolute')
+  assert.equal(resolveDest('My Playlist'), pathmod.join(root, 'My Playlist'))
+  assert.equal(resolveDest('  spaced  '), pathmod.join(root, 'spaced'))
+
+  for (const nasty of [
+    '../../../etc', '..', '../..', 'a/../../..', '/etc/passwd', '\\\\windows\\system32',
+    '....//....//etc', '.', '...', './hidden'
+  ]) {
+    const out = resolveDest(nasty)
+    assert.ok(
+      out === root || out.startsWith(root + pathmod.sep),
+      `"${nasty}" escaped the download root: ${out}`
+    )
+  }
 
   // the flags the progress stream depends on must survive dargs
   const flags = ytdl.args({ newline: true, progress: true, extractAudio: true, audioFormat: 'mp3' })

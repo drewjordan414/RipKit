@@ -125,6 +125,11 @@ export default function App () {
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [deliver, setDeliver] = useState('zip')
+  const [folder, setFolder] = useState('')
+  const [root, setRoot] = useState('')
+  const [sep, setSep] = useState('/')
+  const [saved, setSaved] = useState(null)
   const [error, setError] = useState('')
   const [shownDone, setShownDone] = useState(PAGE)
   const [shownQueue, setShownQueue] = useState(PAGE)
@@ -159,6 +164,13 @@ export default function App () {
       })
     } catch { /* server is mid-rip; the next tick retries */ }
   }
+
+  useEffect(() => {
+    fetch('/destination')
+      .then((r) => r.json())
+      .then((d) => { setRoot(d.root); setSep(d.separator) })
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     if (!busy) return
@@ -216,6 +228,8 @@ export default function App () {
 
     setError('')
     setFile(f)
+    setSaved(null)
+    setFolder((prev) => prev || f.name.replace(/\.csv$/i, ''))
     setTracks([])
     setShownDone(PAGE)
     setShownQueue(PAGE)
@@ -253,17 +267,27 @@ export default function App () {
     body.append('csv', file)
     body.append('quality', quality)
     body.append('format', format)
+    body.append('deliver', deliver)
+    body.append('folder', folder)
 
     try {
       const res = await fetch('/upload', { method: 'POST', body })
-      if (!res.ok) throw new Error(`server responded ${res.status}`)
+      if (!res.ok) {
+        const why = await res.json().catch(() => ({}))
+        throw new Error(why.error || `server responded ${res.status}`)
+      }
 
-      const url = URL.createObjectURL(await res.blob())
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'songs.zip'
-      a.click()
-      URL.revokeObjectURL(url)
+      if ((res.headers.get('Content-Type') || '').includes('application/json')) {
+        const data = await res.json()
+        setSaved(data)
+      } else {
+        const url = URL.createObjectURL(await res.blob())
+        const a = document.createElement('a')
+        a.href = url
+        a.download = 'songs.zip'
+        a.click()
+        URL.revokeObjectURL(url)
+      }
     } catch (err) {
       setError(`Rip failed: ${err.message}. Check the terminal running the server.`)
     } finally {
@@ -361,6 +385,12 @@ export default function App () {
 
       {error && <p className='error'>{error}</p>}
 
+      {saved && (
+        <p className='saved'>
+          Saved {saved.files} {saved.files === 1 ? 'file' : 'files'} to <code>{saved.saved}</code>
+        </p>
+      )}
+
       {loaded && (
         <>
           <section className='bar'>
@@ -382,6 +412,51 @@ export default function App () {
               <p className='pills__note'>
                 {FORMATS.find((f) => f.value === format).note}
               </p>
+            </fieldset>
+
+            <fieldset className='pills' disabled={busy}>
+              <legend>Where it goes</legend>
+              <div className='pills__row'>
+                <button
+                  type='button'
+                  className={deliver === 'zip' ? 'is-on' : ''}
+                  aria-pressed={deliver === 'zip'}
+                  onClick={() => setDeliver('zip')}
+                >
+                  ZIP download
+                </button>
+                <button
+                  type='button'
+                  className={deliver === 'save' ? 'is-on' : ''}
+                  aria-pressed={deliver === 'save'}
+                  onClick={() => setDeliver('save')}
+                >
+                  Save to folder
+                </button>
+              </div>
+
+              {deliver === 'save'
+                ? (
+                  <div className='dest'>
+                    <input
+                      className='dest__input'
+                      value={folder}
+                      placeholder='folder name'
+                      disabled={busy}
+                      onChange={(e) => setFolder(e.target.value)}
+                    />
+                    <p className='dest__path'>
+                      {root
+                        ? <>Files land in <code>{root}{sep}{folder || ''}</code></>
+                        : 'Reading the server download folder…'}
+                    </p>
+                  </div>
+                  )
+                : (
+                  <p className='pills__note'>
+                    Your browser downloads one <code>songs.zip</code>. Nothing is kept on the server.
+                  </p>
+                  )}
             </fieldset>
 
             <fieldset className='pills' disabled={noBitrate || busy}>

@@ -21,6 +21,40 @@ const progress = { total: 0, done: 0, tracks: [] }
 // The rip in flight, so it can be stopped. Single-user app, so one is enough.
 let currentJob = null
 
+// Where finished files land when you choose "save to folder".
+//
+// In Docker this is the mount point: a container cannot write to an arbitrary
+// host path, only to what you bind-mount into it. Run it with
+//   -v /your/music:/downloads -e DOWNLOAD_DIR=/downloads
+// and the folder you pick in the UI becomes a subfolder of /your/music.
+const DOWNLOAD_ROOT = path.resolve(process.env.DOWNLOAD_DIR || './downloads')
+
+// A folder name from the browser is untrusted input that becomes a real path.
+// Treat it as a name, never a path, and verify the result stays inside the root.
+function resolveDest (sub) {
+  const name = String(sub || '').trim()
+  if (!name) return DOWNLOAD_ROOT
+
+  const safe = name
+    .replace(/[/\\]+/g, ' ') // no separators: this is one folder, not a path
+    .replace(/\.{2,}/g, '') // no traversal
+    .replace(/^[.\s]+|[.\s]+$/g, '') // no leading dot or stray whitespace
+    .slice(0, 120)
+
+  if (!safe) return DOWNLOAD_ROOT
+
+  const full = path.resolve(DOWNLOAD_ROOT, safe)
+  if (full !== DOWNLOAD_ROOT && !full.startsWith(DOWNLOAD_ROOT + path.sep)) {
+    throw new Error('That folder is outside the download directory.')
+  }
+  return full
+}
+
+// Let the page show the real path files will land in
+app.get('/destination', (req, res) => {
+  res.json({ root: DOWNLOAD_ROOT, separator: path.sep })
+})
+
 // What each container can carry, for tagging. This covers more formats than
 // we offer as conversion targets, because "original" hands back whatever
 // codec the source used — usually opus or m4a, occasionally webm.
@@ -424,9 +458,18 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   const userQuality = req.body.quality || '0'
   const format = normalizeFormat(req.body.format)
 
+  // "save" writes straight into the chosen folder; "zip" stages in a temp
+  // folder that gets cleaned up once the response is out the door
+  const saving = req.body.deliver === 'save'
+  let tempFolder
+  try {
+    tempFolder = saving ? resolveDest(req.body.folder) : 'mp3s_' + Date.now()
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
+  }
+
   const songs = await parseCsv(req.file.path)
-  const tempFolder = 'mp3s_' + Date.now()
-  fs.mkdirSync(tempFolder)
+  fs.mkdirSync(tempFolder, { recursive: true })
 
   const job = { cancelled: false, child: null }
   currentJob = job
@@ -552,6 +595,13 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
     progress.tracks = []
   }, 60_000)
 
+  const landed = fs.readdirSync(tempFolder).filter((f) => !f.endsWith('_cover.jpg'))
+
+  if (saving) {
+    // files are already where the user asked for them — nothing to ship back
+    return res.json({ saved: tempFolder, files: landed.length })
+  }
+
   // Create ZIP to send to user
   res.setHeader('Content-Type', 'application/zip')
   res.setHeader('Content-Disposition', 'attachment; filename=songs.zip')
@@ -560,6 +610,11 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   zip.pipe(res)
   zip.directory(tempFolder, false)
   zip.finalize()
+
+  // the staging folder is scratch — do not leave one behind per rip
+  res.on('close', () => {
+    fs.promises.rm(tempFolder, { recursive: true, force: true }).catch(() => {})
+  })
 })
 
 if (require.main === module) {
@@ -568,5 +623,5 @@ if (require.main === module) {
 
 module.exports = {
   FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
-  toTrack
+  toTrack, resolveDest
 }

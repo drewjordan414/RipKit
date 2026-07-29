@@ -43,6 +43,34 @@ MP3 offers three bitrates: **Best** (VBR, ~245 kbps), **192k**, and **128k**. Th
 
 A lossless container around already-compressed audio does not recover anything — it just stores the damage at a higher bitrate. The app reports the real codec and bitrate of every file as it downloads, so you can check this yourself.
 
+## Where files land
+
+Two delivery modes:
+
+- **ZIP download** (default) — your browser downloads one `songs.zip`. Nothing is kept on the server.
+- **Save to folder** — files are written straight into a folder on the machine running the server, and you name that folder in the UI.
+
+The save root defaults to `./downloads` and is set with the `DOWNLOAD_DIR` environment variable:
+
+```bash
+DOWNLOAD_DIR=~/Music/Rips npm start
+```
+
+The folder you type in the UI becomes a subfolder of that root. It is treated as a *name*, never a path — separators and `..` are stripped, and any result landing outside the root is refused. Test coverage for that is in `test-formats.js`.
+
+### Docker
+
+Not containerised yet, but the destination is already built for it. A container cannot write to an arbitrary host path — only to what you bind-mount into it. So the host folder is chosen at `docker run` time, and the UI picks subfolders inside it:
+
+```bash
+docker run -p 3000:3000 \
+  -v /your/music:/downloads \
+  -e DOWNLOAD_DIR=/downloads \
+  ripkit
+```
+
+A folder named `Chill Mix` in the UI then lands at `/your/music/Chill Mix` on the host. If you want the container to write somewhere else, change the mount, not the app.
+
 ## How it works
 
 - **Preview:** `POST /preview` parses the CSV and looks up cover art on iTunes, so the tracklist can render before any downloading starts
@@ -51,7 +79,7 @@ A lossless container around already-compressed audio does not recover anything �
 - **Download:** `youtube-dl-exec` (yt-dlp) pulls the best audio-only stream into a temp folder like `mp3s_123456789/`. Unless you pick **Original**, yt-dlp shells out to ffmpeg to transcode into your chosen format.
 - **Covers:** iTunes Search API provides square artwork, saved temporarily then embedded
 - **Tagging:** a second `ffmpeg` pass (`-c copy`, no re-encode) writes the tags and attaches the cover
-- **Packaging:** `archiver` builds a ZIP and streams it back to your browser
+- **Packaging:** in ZIP mode `archiver` builds the archive, streams it back, and the staging folder is removed. In save mode the files are already in place, and the server returns a count instead.
 
 ## Install & run
 
