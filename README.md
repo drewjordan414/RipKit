@@ -19,6 +19,8 @@ Tired of streaming algorithms deciding what you should listen to? Tired of losin
 
 Drop a CSV and the page renders your tracklist immediately, cover art and all. Once a rip starts, the track being worked on gets promoted to its own panel — full-size album art with yt-dlp's real download percentage running across it. Finished tracks stack up underneath, newest first, each showing the codec and bitrate it actually got or the reason it failed. Long playlists load 25 rows at a time.
 
+You can stop a rip at any point. The running download is killed, the interrupted track is marked **Stopped**, and you still get a ZIP of everything that finished — stopping is never a total loss.
+
 ## Formats
 
 There are two, on purpose.
@@ -100,7 +102,7 @@ node test-formats.js
 1. Export your playlist as a CSV — [Chosic](https://www.chosic.com/spotify-playlist-exporter/) does it for Spotify, or use any service that gives you title and artist columns
 2. Open http://localhost:3000
 3. Drop the CSV in — the tracklist appears with cover art before anything downloads
-4. Pick a format and bitrate, hit rip, and watch each row report its own progress
+4. Pick a format and bitrate, hit rip, and watch each row report its own progress. **Stop ripping** halts it and still hands back what finished.
 5. Your browser downloads `songs.zip` with clean filenames, embedded covers, and tags
 
 ## Stack

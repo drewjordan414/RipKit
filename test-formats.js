@@ -7,7 +7,8 @@ const fs = require('fs')
 const { execFileSync } = require('child_process')
 const ytdl = require('youtube-dl-exec')
 const {
-  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress
+  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
+  toTrack
 } = require('./server')
 
 const DIR = 'test_tmp'
@@ -41,6 +42,32 @@ async function main () {
   assert.equal(parseProgress('[download]  10.0% of 1MiB\n[download]  72.5% of 1MiB\n'), 72.5)
   assert.equal(parseProgress('[ExtractAudio] Destination: song.mp3'), null)
   assert.equal(parseProgress(''), null)
+
+  // Column detection. Exporters disagree on case and separators, and matching
+  // exact strings silently turned a whole 17k-row library into blank rows.
+  const HEADERS = [
+    // Spotify library export — the one that broke it
+    { 'Track name': 'Lonely in the Future', 'Artist name': 'The Strokes', Album: 'Reality Awaits' },
+    { Title: 'Lonely in the Future', Artist: 'The Strokes', Album: 'Reality Awaits' },
+    { title: 'Lonely in the Future', artist: 'The Strokes', album: 'Reality Awaits' },
+    { track_name: 'Lonely in the Future', artist_name: 'The Strokes', album_name: 'Reality Awaits' },
+    { TRACK: 'Lonely in the Future', ARTISTS: 'The Strokes', RECORD: 'Reality Awaits' },
+    { 'Song Name': 'Lonely in the Future', Performer: 'The Strokes', Release: 'Reality Awaits' }
+  ]
+
+  for (const row of HEADERS) {
+    const t = toTrack(row)
+    const cols = Object.keys(row).join('/')
+    assert.equal(t.title, 'Lonely in the Future', `title not found in ${cols}`)
+    assert.equal(t.artist, 'The Strokes', `artist not found in ${cols}`)
+    assert.equal(t.album, 'Reality Awaits', `album not found in ${cols}`)
+  }
+
+  // year gets pulled out of whatever date-ish column exists
+  assert.equal(toTrack({ Title: 'x', Artist: 'y', 'Release Date': '2016-08-20' }).year, '2016')
+  assert.equal(toTrack({ Title: 'x', Artist: 'y', Year: '1994' }).year, '1994')
+  // a row with no usable columns stays empty rather than inventing something
+  assert.equal(toTrack({ ISRC: 'USRC12600729', Type: 'Favorite' }).title, '')
 
   // the flags the progress stream depends on must survive dargs
   const flags = ytdl.args({ newline: true, progress: true, extractAudio: true, audioFormat: 'mp3' })

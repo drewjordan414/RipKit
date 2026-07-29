@@ -13,9 +13,13 @@ const upload = multer({ dest: 'uploads/' })
 
 // serve the built React app (npm run build)
 app.use(express.static('dist'))
+app.use(express.json({ limit: '1mb' }))
 
 // simple in-memory progress tracker (single-user / local use)
 const progress = { total: 0, done: 0, tracks: [] }
+
+// The rip in flight, so it can be stopped. Single-user app, so one is enough.
+let currentJob = null
 
 // What each container can carry, for tagging. This covers more formats than
 // we offer as conversion targets, because "original" hands back whatever
@@ -90,13 +94,19 @@ function makeFileBaseFromTitle (title) {
     .trim()
 }
 
+// Column names differ by exporter in case and separators alone: "Track name",
+// "Track Name", "track_name" and "trackname" are the same column. Compare on a
+// flattened key so one candidate covers every spelling.
+const normKey = (s) => String(s).toLowerCase().replace(/[\s_\-.]+/g, '')
+
 // helper: get first non-empty field from a list of possible column names
 function getField (row, candidates) {
-  for (const key of candidates) {
-    if (Object.prototype.hasOwnProperty.call(row, key) && row[key] != null) {
-      const val = String(row[key]).trim()
-      if (val) return val
-    }
+  const flat = {}
+  for (const key of Object.keys(row)) flat[normKey(key)] = row[key]
+
+  for (const candidate of candidates) {
+    const val = flat[normKey(candidate)]
+    if (val != null && String(val).trim()) return String(val).trim()
   }
   return ''
 }
@@ -105,13 +115,7 @@ function getField (row, candidates) {
 function getYear (row) {
   // direct year-ish fields
   const directYearRaw = getField(row, [
-    'year',
-    'Year',
-    'release_year',
-    'Release Year',
-    'ReleaseYear',
-    'published_year',
-    'Published Year'
+    'year', 'release year', 'published year'
   ])
 
   if (directYearRaw) {
@@ -121,18 +125,7 @@ function getYear (row) {
 
   // album / release date style fields
   const albumDateRaw = getField(row, [
-    'albumdate',
-    'AlbumDate',
-    'album_date',
-    'album date',
-    'album_release_date',
-    'Album Release Date',
-    'release_date',
-    'Release Date',
-    'released_at',
-    'Released At',
-    'date',
-    'Date'
+    'album date', 'album release date', 'release date', 'released at', 'date'
   ])
 
   if (albumDateRaw) {
@@ -145,16 +138,7 @@ function getYear (row) {
 
 // helper: get genre from multiple possible fields
 function getGenre (row) {
-  return getField(row, [
-    'genre',
-    'Genre',
-    'genres',
-    'Genres',
-    'style',
-    'Style',
-    'mood',
-    'Mood'
-  ])
+  return getField(row, ['genre', 'genres', 'style', 'mood'])
 }
 
 // 1) Download audio only (no metadata, no thumbnail).
@@ -254,16 +238,13 @@ async function saveArt (artUrl, tempFolder, fileBase) {
 function toTrack (row) {
   return {
     title: getField(row, [
-      'title', 'Title', 'track', 'Track', 'track_name', 'Track Name',
-      'trackName', 'name', 'Name', 'song', 'Song'
+      'title', 'track', 'track name', 'song', 'song name', 'name'
     ]),
     artist: getField(row, [
-      'artist', 'Artist', 'artists', 'Artists', 'artist_name', 'Artist Name',
-      'singer', 'Singer', 'performer', 'Performer'
+      'artist', 'artists', 'artist name', 'album artist', 'singer', 'performer'
     ]),
     album: getField(row, [
-      'album', 'Album', 'album_name', 'Album Name', 'albumName',
-      'record', 'Record', 'release', 'Release'
+      'album', 'album name', 'record', 'release'
     ]),
     year: getYear(row),
     genre: getGenre(row)
@@ -370,33 +351,72 @@ function applyMetadataAndCover (audioPath, coverPath, meta) {
   })
 }
 
-// Simple endpoint for polling progress from frontend
+// Progress for the frontend. Only send rows that have actually moved — a
+// library export can be 17k rows, and shipping all of them every second is
+// megabytes of "queued". A finished row never changes again, so the page
+// keeps what it already saw.
+const PROGRESS_WINDOW = 300
+
 app.get('/progress', (req, res) => {
-  res.json(progress)
+  const moved = {}
+  let sent = 0
+
+  for (let i = progress.tracks.length - 1; i >= 0 && sent < PROGRESS_WINDOW; i--) {
+    const t = progress.tracks[i]
+    if (t.status === 'queued') continue
+    moved[i] = t
+    sent++
+  }
+
+  res.json({ total: progress.total, done: progress.done, tracks: moved })
 })
 
-// Read the CSV and hand back the tracklist (with cover art) before ripping,
-// so the page can show what it is about to do.
+// Read the CSV and hand back the tracklist before ripping, so the page can
+// show what it is about to do. No artwork here: a library export can hold
+// tens of thousands of rows, and one iTunes call each would melt.
 app.post('/preview', upload.single('csv'), async (req, res) => {
   try {
     const tracks = await parseCsv(req.file.path)
-
-    // iTunes is fast but we still have one call per track — run them together
-    const withArt = await Promise.all(
-      tracks.map(async (t) => ({
+    res.json({
+      tracks: tracks.map((t) => ({
         ...t,
-        art: t.title && t.artist ? await lookupArt(t.title, t.artist) : null,
         status: t.title && t.artist ? 'queued' : 'skipped'
       }))
-    )
-
-    res.json({ tracks: withArt })
+    })
   } catch (err) {
     console.log('Preview failed:', err)
     res.status(400).json({ error: 'Could not read that CSV.' })
   } finally {
     fs.promises.unlink(req.file.path).catch(() => {})
   }
+})
+
+// Stop the rip in flight. Kills the running yt-dlp, drops out of the loop,
+// and lets /upload return a ZIP of whatever finished — you keep what you got.
+app.post('/cancel', (req, res) => {
+  if (!currentJob) return res.json({ stopped: false, reason: 'nothing is running' })
+  currentJob.cancelled = true
+  currentJob.child?.kill('SIGTERM')
+  res.json({ stopped: true })
+})
+
+// Cover art for the rows currently on screen. The page asks for a page's
+// worth at a time, so this stays bounded no matter how big the CSV is.
+const ART_BATCH = 60
+const ART_CONCURRENCY = 6
+
+app.post('/art', async (req, res) => {
+  const wanted = Array.isArray(req.body?.tracks) ? req.body.tracks.slice(0, ART_BATCH) : []
+  const art = {}
+
+  for (let i = 0; i < wanted.length; i += ART_CONCURRENCY) {
+    const slice = wanted.slice(i, i + ART_CONCURRENCY)
+    await Promise.all(slice.map(async (t) => {
+      art[t.index] = t.title && t.artist ? await lookupArt(t.title, t.artist) : null
+    }))
+  }
+
+  res.json({ art })
 })
 
 // Handle CSV upload → return ZIP
@@ -408,6 +428,9 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   const tempFolder = 'mp3s_' + Date.now()
   fs.mkdirSync(tempFolder)
 
+  const job = { cancelled: false, child: null }
+  currentJob = job
+
   progress.total = songs.length
   progress.done = 0
   progress.tracks = songs.map((s) => ({
@@ -417,6 +440,11 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   }))
 
   for (const [i, s] of songs.entries()) {
+    if (job.cancelled) {
+      console.log('Rip stopped by request')
+      break
+    }
+
     const track = progress.tracks[i]
     const { title, artist, album, year, genre } = s
 
@@ -443,6 +471,15 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
         continue
       }
 
+      // the YouTube search is not killable, so check again before committing
+      // to a download
+      if (job.cancelled) {
+        track.status = 'stopped'
+        track.detail = 'Stopped'
+        track.percent = 0
+        continue
+      }
+
       // filename ONLY from title, with spaces (no underscores)
       const fileBase = makeFileBaseFromTitle(title)
       const outputTemplate = `${tempFolder}/${fileBase}.%(ext)s`
@@ -450,9 +487,12 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       // 1) download pure audio. The download is the long part, so it owns
       // most of the bar; tagging tops off the rest.
       track.detail = 'downloading audio'
-      await downloadAudio(video.url, outputTemplate, userQuality, format, (pct) => {
+      const sub = downloadAudio(video.url, outputTemplate, userQuality, format, (pct) => {
         track.percent = Math.round(pct * 0.9)
       })
+      job.child = sub // so /cancel can kill it mid-download
+      await sub
+      job.child = null
 
       const audioPath = findDownloaded(tempFolder, fileBase)
       if (!audioPath) {
@@ -486,13 +526,24 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       track.detail = probeAudio(audioPath)
       track.percent = 100
     } catch (err) {
-      track.status = 'failed'
-      track.detail = String(err.message || err).slice(0, 120)
-      console.log('Error downloading:', err)
+      if (job.cancelled) {
+        // we killed it — not a failure, and not silently back to queued:
+        // /progress only reports rows that moved, so it needs its own status
+        track.status = 'stopped'
+        track.detail = 'Stopped'
+        track.percent = 0
+      } else {
+        track.status = 'failed'
+        track.detail = String(err.message || err).slice(0, 120)
+        console.log('Error downloading:', err)
+      }
     } finally {
-      progress.done++
+      if (!job.cancelled) progress.done++
     }
   }
+
+  currentJob = null
+  fs.promises.unlink(req.file.path).catch(() => {})
 
   // when we're done, reset progress after a little while (optional)
   setTimeout(() => {
@@ -516,5 +567,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress
+  FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
+  toTrack
 }

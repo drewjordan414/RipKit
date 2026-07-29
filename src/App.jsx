@@ -17,7 +17,7 @@ const FORMATS = [
 // bitrate only means something when we are actually re-encoding
 const BITRATE_OK = ['mp3']
 
-const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–' }
+const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–', stopped: '–' }
 
 // how many rows land at a time
 const PAGE = 25
@@ -124,10 +124,12 @@ export default function App () {
   const [busy, setBusy] = useState(false)
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [error, setError] = useState('')
   const [shownDone, setShownDone] = useState(PAGE)
   const [shownQueue, setShownQueue] = useState(PAGE)
   const inputRef = useRef(null)
+  const artAsked = useRef(new Set())
 
   const noBitrate = !BITRATE_OK.includes(format)
 
@@ -136,25 +138,74 @@ export default function App () {
   const active = activeIdx >= 0 ? tracks[activeIdx] : null
   // newest first, so a finished track lands directly under the one ripping
   const finished = indexed.filter(({ track }) => track.status === 'done' || track.status === 'failed').reverse()
-  const queued = indexed.filter(({ track }) => track.status === 'queued' || track.status === 'skipped')
+  const queued = indexed.filter(({ track }) =>
+    ['queued', 'skipped', 'stopped'].includes(track.status))
 
   const done = tracks.filter((t) => t.status === 'done').length
   const failed = tracks.filter((t) => t.status === 'failed' || t.status === 'skipped').length
 
+  const syncProgress = async () => {
+    try {
+      const res = await fetch('/progress')
+      if (!res.ok) return
+      const data = await res.json()
+      const moved = Object.entries(data.tracks || {})
+      if (!moved.length) return
+      // the server sends only rows that changed; everything else we already have
+      setTracks((prev) => {
+        const next = [...prev]
+        for (const [i, patch] of moved) next[i] = { ...next[i], ...patch }
+        return next
+      })
+    } catch { /* server is mid-rip; the next tick retries */ }
+  }
+
   useEffect(() => {
     if (!busy) return
-    const id = setInterval(async () => {
-      try {
-        const res = await fetch('/progress')
-        if (!res.ok) return
-        const data = await res.json()
-        if (!data.tracks?.length) return
-        // the server only reports status; titles and art stay client-side
-        setTracks((prev) => prev.map((t, i) => ({ ...t, ...(data.tracks[i] || {}) })))
-      } catch { /* server is mid-rip; next tick retries */ }
-    }, 700)
+    const id = setInterval(syncProgress, 700)
     return () => clearInterval(id)
   }, [busy])
+
+  // Cover art for the rows on screen, a page at a time. Fetching art for the
+  // whole CSV up front does not survive a 17k-row library export.
+  useEffect(() => {
+    const visible = [
+      ...(active ? [{ track: active, index: activeIdx }] : []),
+      ...finished.slice(0, shownDone),
+      ...queued.slice(0, shownQueue)
+    ]
+
+    const need = visible.filter(({ track, index }) =>
+      track && track.art === undefined && track.title && track.artist &&
+      !artAsked.current.has(index)
+    ).slice(0, 60)
+
+    if (!need.length) return
+    need.forEach(({ index }) => artAsked.current.add(index))
+
+    ;(async () => {
+      try {
+        const res = await fetch('/art', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tracks: need.map(({ track, index }) => ({
+              index, title: track.title, artist: track.artist
+            }))
+          })
+        })
+        const { art } = await res.json()
+        setTracks((prev) => {
+          const next = [...prev]
+          for (const [i, url] of Object.entries(art)) next[i] = { ...next[i], art: url }
+          return next
+        })
+      } catch {
+        // let a later render retry these
+        need.forEach(({ index }) => artAsked.current.delete(index))
+      }
+    })()
+  }, [tracks, shownDone, shownQueue, activeIdx])
 
   const pick = async (f) => {
     if (!f) return
@@ -168,6 +219,7 @@ export default function App () {
     setTracks([])
     setShownDone(PAGE)
     setShownQueue(PAGE)
+    artAsked.current = new Set()
     setReading(true)
 
     try {
@@ -189,6 +241,7 @@ export default function App () {
   const rip = async () => {
     if (!file || busy) return
     setBusy(true)
+    setStopping(false)
     setError('')
     setShownDone(PAGE)
     setShownQueue(PAGE)
@@ -214,7 +267,22 @@ export default function App () {
     } catch (err) {
       setError(`Rip failed: ${err.message}. Check the terminal running the server.`)
     } finally {
+      // one last read, so a stopped rip does not leave a row stuck on "working"
+      await syncProgress()
       setBusy(false)
+      setStopping(false)
+    }
+  }
+
+  // Stop the rip. The server kills the running download and still returns a
+  // ZIP of whatever finished, so a stop is never a total loss.
+  const stop = async () => {
+    setStopping(true)
+    try {
+      await fetch('/cancel', { method: 'POST' })
+    } catch {
+      setError('Could not reach the server to stop the rip.')
+      setStopping(false)
     }
   }
 
@@ -223,6 +291,7 @@ export default function App () {
     setTracks([])
     setShownDone(PAGE)
     setShownQueue(PAGE)
+    artAsked.current = new Set()
     setError('')
     if (inputRef.current) inputRef.current.value = ''
   }
@@ -237,9 +306,15 @@ export default function App () {
         {loaded
           ? (
             <div className='counts'>
-              <span>{tracks.length} tracks</span>
-              {done > 0 && <span className='counts__done'>{done} done</span>}
-              {failed > 0 && <span className='counts__failed'>{failed} skipped</span>}
+              <span className='counts__stat'>
+                <b>{tracks.length}</b> tracks
+              </span>
+              {done > 0 && (
+                <span className='counts__stat is-done'><b>{done}</b> done</span>
+              )}
+              {failed > 0 && (
+                <span className='counts__stat is-failed'><b>{failed}</b> skipped</span>
+              )}
               <button className='counts__reset' onClick={reset} disabled={busy}>
                 Start over
               </button>
@@ -331,13 +406,19 @@ export default function App () {
               </p>
             </fieldset>
 
-            <button className='go' onClick={rip} disabled={busy}>
-              {busy
-                ? `Ripping ${done + failed + 1} of ${tracks.length}…`
-                : format === 'original'
-                  ? 'Rip at source quality'
-                  : `Rip to ${format.toUpperCase()}`}
-            </button>
+            {busy
+              ? (
+                <button className='go go--stop' onClick={stop} disabled={stopping}>
+                  {stopping ? 'Stopping…' : 'Stop ripping'}
+                </button>
+                )
+              : (
+                <button className='go' onClick={rip}>
+                  {format === 'original'
+                    ? 'Rip at source quality'
+                    : `Rip to ${format.toUpperCase()}`}
+                </button>
+                )}
           </section>
 
           {active && (
