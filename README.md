@@ -109,15 +109,22 @@ git clone https://github.com/drewjordan414/RipKit.git
 cd RipKit
 
 npm install
-npm start          # builds the UI, then serves it at http://localhost:3000
+npm start          # builds the UI and serves it at http://localhost:3000
 ```
 
-For UI work, run the API and the Vite dev server side by side:
+That is the whole thing — one command, front end and back end.
+
+For UI work, `npm run dev` is likewise a single command. It starts Vite on :5173 with hot reload **and** the API on :3000, and shuts the API down with it:
 
 ```bash
-npm run server     # API on :3000
-npm run dev        # UI on :5173 with hot reload, proxying to :3000
+npm run dev        # http://localhost:5173
 ```
+
+| Command | What runs |
+| --- | --- |
+| `npm start` | Builds the UI, serves everything from the Express server on :3000 |
+| `npm run dev` | Vite on :5173 with hot reload, plus the API on :3000 |
+| `npm run server` | Just the API, if you want to drive it yourself |
 
 Check the format tagging logic without downloading anything:
 

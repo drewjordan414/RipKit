@@ -9,7 +9,7 @@ const pathmod = require('path')
 const ytdl = require('youtube-dl-exec')
 const {
   FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
-  toTrack, resolveDest
+  toTrack, resolveDest, readableError
 } = require('./server')
 
 const DIR = 'test_tmp'
@@ -87,6 +87,18 @@ async function main () {
       `"${nasty}" escaped the download root: ${out}`
     )
   }
+
+  // Failure text a person can act on, not a dump of the spawned command
+  assert.equal(
+    readableError({ stderr: 'blah\nERROR: Video unavailable\nmore' }),
+    'Video unavailable'
+  )
+  assert.equal(
+    readableError(new Error("The command spawned as: '/Users/x/yt-dlp' 'https://…' failed")),
+    'Download failed',
+    'a bare spawn dump must not reach the UI'
+  )
+  assert.equal(readableError({ stderr: 'ffmpeg exited with code 8' }), 'ffmpeg could not convert this track')
 
   // the flags the progress stream depends on must survive dargs
   const flags = ytdl.args({ newline: true, progress: true, extractAudio: true, audioFormat: 'mp3' })

@@ -208,6 +208,18 @@ function downloadAudio (url, outputTemplate, userQuality, format, onPercent) {
   return sub
 }
 
+// A failed spawn stringifies to the whole command line, which tells a user
+// nothing. yt-dlp puts the real reason on an "ERROR:" line in stderr.
+function readableError (err) {
+  const text = String(err?.stderr || err?.message || err)
+  const line = text.split('\n').find((l) => /^\s*ERROR:/i.test(l))
+  if (line) {
+    return line.replace(/^\s*ERROR:\s*/i, '').replace(/^\[\w+\]\s*\S+:\s*/, '').slice(0, 120)
+  }
+  if (/ffmpeg/i.test(text)) return 'ffmpeg could not convert this track'
+  return 'Download failed'
+}
+
 // yt-dlp writes "[download]  45.2% of ~3.50MiB at 1.20MiB/s ETA 00:02".
 // A chunk can hold several updates — only the last one is current.
 function parseProgress (chunk) {
@@ -577,7 +589,7 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
         track.percent = 0
       } else {
         track.status = 'failed'
-        track.detail = String(err.message || err).slice(0, 120)
+        track.detail = readableError(err)
         console.log('Error downloading:', err)
       }
     } finally {
@@ -623,5 +635,5 @@ if (require.main === module) {
 
 module.exports = {
   FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
-  toTrack, resolveDest
+  toTrack, resolveDest, readableError
 }
