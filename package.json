@@ -14,7 +14,8 @@
     "dev": "vite",
     "build": "vite build",
     "server": "node server.js",
-    "start": "npm run build && node server.js"
+    "start": "npm run build && node server.js",
+    "test": "node test-formats.js && node test-job.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",

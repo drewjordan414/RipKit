@@ -15,11 +15,12 @@ const upload = multer({ dest: 'uploads/' })
 app.use(express.static('dist'))
 app.use(express.json({ limit: '1mb' }))
 
-// simple in-memory progress tracker (single-user / local use)
-const progress = { total: 0, done: 0, tracks: [] }
-
-// The rip in flight, so it can be stopped. Single-user app, so one is enough.
-let currentJob = null
+// The one rip, running or most recently finished. Single-user app, so one is
+// enough. It deliberately outlives the request that started it: closing or
+// reloading the page must not touch a rip in flight, and the page needs
+// something to reattach to when it comes back.
+let job = null
+let jobSeq = 0
 
 // Where finished files land when you choose "save to folder".
 //
@@ -29,18 +30,38 @@ let currentJob = null
 // and the folder you pick in the UI becomes a subfolder of /your/music.
 const DOWNLOAD_ROOT = path.resolve(process.env.DOWNLOAD_DIR || './downloads')
 
-// A folder name from the browser is untrusted input that becomes a real path.
-// Treat it as a name, never a path, and verify the result stays inside the root.
-function resolveDest (sub) {
-  const name = String(sub || '').trim()
-  if (!name) return DOWNLOAD_ROOT
+// Scratch space for ZIP rips. The archive is built after the rip finishes
+// rather than streamed out of it, so the files have to sit somewhere the next
+// request can find them.
+const STAGE_ROOT = path.resolve(process.env.STAGE_DIR || './.staging')
 
-  const safe = name
+// Where "ZIP on server" leaves the archive. Defaults to a folder in the
+// project directory, which is the point: running this on a box you SSH into,
+// you want the zip to land next to the app, not stream to a browser that may
+// not be there. Override with ZIP_DIR.
+const ZIP_ROOT = path.resolve(process.env.ZIP_DIR || './output')
+
+// zip   → the browser fetches the archive
+// archive → the archive is written into ZIP_ROOT on this machine
+// save  → loose tagged files land in a folder under DOWNLOAD_ROOT
+const DELIVERY = ['zip', 'archive', 'save']
+const normalizeDeliver = (d) => DELIVERY.includes(String(d)) ? String(d) : 'zip'
+
+// A folder name from the browser is untrusted input that becomes a real path
+// and a Content-Disposition filename. Treat it as a name, never a path.
+function safeName (sub) {
+  return String(sub || '')
     .replace(/[/\\]+/g, ' ') // no separators: this is one folder, not a path
     .replace(/\.{2,}/g, '') // no traversal
+    .replace(/[\r\n"]/g, '') // nothing that can break out of a header
     .replace(/^[.\s]+|[.\s]+$/g, '') // no leading dot or stray whitespace
     .slice(0, 120)
+    .trim()
+}
 
+// Verify the resolved folder stays inside the root before anything writes to it.
+function resolveDest (sub) {
+  const safe = safeName(sub)
   if (!safe) return DOWNLOAD_ROOT
 
   const full = path.resolve(DOWNLOAD_ROOT, safe)
@@ -50,9 +71,9 @@ function resolveDest (sub) {
   return full
 }
 
-// Let the page show the real path files will land in
+// Let the page show the real paths files will land in
 app.get('/destination', (req, res) => {
-  res.json({ root: DOWNLOAD_ROOT, separator: path.sep })
+  res.json({ root: DOWNLOAD_ROOT, zipRoot: ZIP_ROOT, separator: path.sep })
 })
 
 // What each container can carry, for tagging. This covers more formats than
@@ -229,6 +250,11 @@ function parseProgress (chunk) {
   return Number.isNaN(pct) ? null : pct
 }
 
+// Artwork is decorative, so nothing about it may ever hold a request open.
+// iTunes rate-limits at roughly 20 calls a minute and a throttled call can
+// hang for a long time; every lookup gets a hard deadline instead.
+const ART_TIMEOUT = 6000
+
 // 2a) Ask iTunes for a square cover URL. Cheap enough to run before a rip so
 // the tracklist can show artwork while everything is still queued.
 async function lookupArt (title, artist) {
@@ -238,7 +264,7 @@ async function lookupArt (title, artist) {
       term
     )}&entity=song&limit=1`
 
-    const res = await fetch(apiURL)
+    const res = await fetch(apiURL, { signal: AbortSignal.timeout(ART_TIMEOUT) })
     if (!res.ok) {
       console.log('iTunes search failed:', res.status)
       return null
@@ -264,7 +290,7 @@ async function lookupArt (title, artist) {
 async function saveArt (artUrl, tempFolder, fileBase) {
   if (!artUrl) return null
   try {
-    const imgRes = await fetch(artUrl)
+    const imgRes = await fetch(artUrl, { signal: AbortSignal.timeout(ART_TIMEOUT) })
     if (!imgRes.ok) {
       console.log('Failed to download artwork:', artUrl)
       return null
@@ -397,6 +423,23 @@ function applyMetadataAndCover (audioPath, coverPath, meta) {
   })
 }
 
+// Everything about the job except the tracklist: small enough to send on every
+// poll, complete enough to tell the page what to draw.
+function jobSummary () {
+  return {
+    id: job.id,
+    status: job.status, // running | done | stopped | failed
+    total: job.total,
+    done: job.done,
+    deliver: job.deliver,
+    folder: job.folder,
+    format: job.format,
+    quality: job.quality,
+    result: job.result,
+    error: job.error
+  }
+}
+
 // Progress for the frontend. Only send rows that have actually moved — a
 // library export can be 17k rows, and shipping all of them every second is
 // megabytes of "queued". A finished row never changes again, so the page
@@ -404,17 +447,62 @@ function applyMetadataAndCover (audioPath, coverPath, meta) {
 const PROGRESS_WINDOW = 300
 
 app.get('/progress', (req, res) => {
+  if (!job) return res.json({ job: null, total: 0, done: 0, tracks: {} })
+
   const moved = {}
   let sent = 0
 
-  for (let i = progress.tracks.length - 1; i >= 0 && sent < PROGRESS_WINDOW; i--) {
-    const t = progress.tracks[i]
+  for (let i = job.tracks.length - 1; i >= 0 && sent < PROGRESS_WINDOW; i--) {
+    const t = job.tracks[i]
     if (t.status === 'queued') continue
-    moved[i] = t
+    moved[i] = { status: t.status, detail: t.detail, percent: t.percent }
     sent++
   }
 
-  res.json({ total: progress.total, done: progress.done, tracks: moved })
+  res.json({ job: jobSummary(), total: job.total, done: job.done, tracks: moved })
+})
+
+// The whole job, tracklist included. This is what a freshly loaded page asks
+// for: reloading mid-rip should put you back where you were, not start over.
+app.get('/job', (req, res) => {
+  if (!job) return res.json({ job: null, tracks: [] })
+  res.json({ job: jobSummary(), tracks: job.tracks })
+})
+
+// Forget a finished job, so "Start over" survives a reload too. A running rip
+// is left alone — stop it first if that is what you meant.
+app.delete('/job', async (req, res) => {
+  if (job?.status === 'running') {
+    return res.status(409).json({ error: 'A rip is still running. Stop it first.' })
+  }
+  await clearStage()
+  job = null
+  res.json({ cleared: true })
+})
+
+// ZIP mode hands back a link instead of streaming out of /upload, so the
+// archive is still there when you come back to the page.
+app.get('/download/:id', (req, res) => {
+  if (!job || job.id !== req.params.id || job.deliver !== 'zip') {
+    return res.status(404).json({ error: 'That download has expired.' })
+  }
+  if (job.status === 'running') {
+    return res.status(409).json({ error: 'The rip is still running.' })
+  }
+  if (!fs.existsSync(job.stage)) {
+    return res.status(404).json({ error: 'That download has expired.' })
+  }
+
+  const name = safeName(job.folder) || 'songs'
+  res.setHeader('Content-Type', 'application/zip')
+  res.setHeader('Content-Disposition', `attachment; filename="${name}.zip"`)
+
+  const zip = archiver('zip')
+  zip.pipe(res)
+  // second arg is the folder the files sit in inside the archive — unzipping
+  // drops one named folder rather than spraying tracks into Downloads
+  zip.directory(job.stage, name)
+  zip.finalize()
 })
 
 // Read the CSV and hand back the tracklist before ripping, so the page can
@@ -437,12 +525,14 @@ app.post('/preview', upload.single('csv'), async (req, res) => {
   }
 })
 
-// Stop the rip in flight. Kills the running yt-dlp, drops out of the loop,
-// and lets /upload return a ZIP of whatever finished — you keep what you got.
+// Stop the rip in flight. Kills the running yt-dlp, drops out of the loop, and
+// still packages whatever finished — a stop is never a total loss.
 app.post('/cancel', (req, res) => {
-  if (!currentJob) return res.json({ stopped: false, reason: 'nothing is running' })
-  currentJob.cancelled = true
-  currentJob.child?.kill('SIGTERM')
+  if (job?.status !== 'running') {
+    return res.json({ stopped: false, reason: 'nothing is running' })
+  }
+  job.cancelled = true
+  job.child?.kill('SIGTERM')
   res.json({ stopped: true })
 })
 
@@ -451,11 +541,19 @@ app.post('/cancel', (req, res) => {
 const ART_BATCH = 60
 const ART_CONCURRENCY = 6
 
+// Ten sequential rounds of a rate-limited API is a request that can sit open
+// for a minute. The page polls progress over the same handful of browser
+// connections, so a slow /art starves the thing the user is actually watching.
+// Return what we have when the clock runs out; a missing cover costs nothing.
+const ART_DEADLINE = 8000
+
 app.post('/art', async (req, res) => {
   const wanted = Array.isArray(req.body?.tracks) ? req.body.tracks.slice(0, ART_BATCH) : []
   const art = {}
+  const until = Date.now() + ART_DEADLINE
 
   for (let i = 0; i < wanted.length; i += ART_CONCURRENCY) {
+    if (Date.now() > until) break
     const slice = wanted.slice(i, i + ART_CONCURRENCY)
     await Promise.all(slice.map(async (t) => {
       art[t.index] = t.title && t.artist ? await lookupArt(t.title, t.artist) : null
@@ -465,34 +563,111 @@ app.post('/art', async (req, res) => {
   res.json({ art })
 })
 
-// Handle CSV upload → return ZIP
+// Handle CSV upload → start a rip
+//
+// This returns as soon as the job is running rather than holding the socket
+// open for the whole rip. The browser is then free to leave: the rip is server
+// state, and the page reattaches to it through /job and /progress.
 app.post('/upload', upload.single('csv'), async (req, res) => {
-  const userQuality = req.body.quality || '0'
-  const format = normalizeFormat(req.body.format)
+  if (!req.file) return res.status(400).json({ error: 'No CSV in that request.' })
+  const done = () => fs.promises.unlink(req.file.path).catch(() => {})
 
-  // "save" writes straight into the chosen folder; "zip" stages in a temp
-  // folder that gets cleaned up once the response is out the door
-  const saving = req.body.deliver === 'save'
-  let tempFolder
+  if (job?.status === 'running') {
+    await done()
+    return res.status(409).json({ error: 'A rip is already running.' })
+  }
+
+  const quality = req.body.quality || '0'
+  const format = normalizeFormat(req.body.format)
+  const folder = safeName(req.body.folder)
+
+  // "save" writes straight into the chosen folder under the download root;
+  // "zip" and "archive" both stage under .staging and get packed at the end
+  const deliver = normalizeDeliver(req.body.deliver)
+  const saving = deliver === 'save'
+  const id = `${Date.now().toString(36)}${(++jobSeq).toString(36)}`
+
+  let dest
   try {
-    tempFolder = saving ? resolveDest(req.body.folder) : 'mp3s_' + Date.now()
+    dest = saving ? resolveDest(folder) : path.join(STAGE_ROOT, id)
   } catch (err) {
+    await done()
     return res.status(400).json({ error: err.message })
   }
 
-  const songs = await parseCsv(req.file.path)
-  fs.mkdirSync(tempFolder, { recursive: true })
+  let songs
+  try {
+    songs = await parseCsv(req.file.path)
+  } catch (err) {
+    return res.status(400).json({ error: 'Could not read that CSV.' })
+  } finally {
+    await done()
+  }
 
-  const job = { cancelled: false, child: null }
-  currentJob = job
+  await clearStage()
+  fs.mkdirSync(dest, { recursive: true })
 
-  progress.total = songs.length
-  progress.done = 0
-  progress.tracks = songs.map((s) => ({
-    status: s.title && s.artist ? 'queued' : 'skipped',
-    detail: s.title && s.artist ? '' : 'No title or artist in this row',
-    percent: 0
-  }))
+  const started = job = {
+    id,
+    status: 'running',
+    deliver,
+    folder,
+    format,
+    quality,
+    dest,
+    stage: saving ? null : dest,
+    total: songs.length,
+    done: 0,
+    result: null,
+    error: '',
+    cancelled: false,
+    child: null,
+    tracks: songs.map((s) => ({
+      title: s.title,
+      artist: s.artist,
+      album: s.album,
+      year: s.year,
+      status: s.title && s.artist ? 'queued' : 'skipped',
+      detail: s.title && s.artist ? '' : 'No title or artist in this row',
+      percent: 0
+    }))
+  }
+
+  // hand the page its job id and let the rip run on its own
+  res.status(202).json({ job: jobSummary() })
+  runRip(started, songs).catch((err) => {
+    console.log('Rip crashed:', err)
+    started.status = 'failed'
+    started.error = readableError(err)
+  })
+})
+
+// Wipe leftover ZIP staging. Called before every rip and on startup, so a
+// killed server never leaves half an archive behind.
+async function clearStage () {
+  await fs.promises.rm(STAGE_ROOT, { recursive: true, force: true }).catch(() => {})
+}
+
+// Build the archive straight onto disk for "ZIP on server". Same shape as the
+// streamed one — tracks sit inside a named folder, not loose at the root.
+function writeArchive (srcDir, outFile, innerName) {
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(path.dirname(outFile), { recursive: true })
+    const out = fs.createWriteStream(outFile)
+    const zip = archiver('zip')
+
+    out.on('close', () => resolve(zip.pointer()))
+    out.on('error', reject)
+    zip.on('error', reject)
+
+    zip.pipe(out)
+    zip.directory(srcDir, innerName)
+    zip.finalize()
+  })
+}
+
+async function runRip (job, songs) {
+  const { format, quality: userQuality, dest: tempFolder } = job
 
   for (const [i, s] of songs.entries()) {
     if (job.cancelled) {
@@ -500,12 +675,12 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       break
     }
 
-    const track = progress.tracks[i]
+    const track = job.tracks[i]
     const { title, artist, album, year, genre } = s
 
     if (!title || !artist) {
       console.log('Skipping row (no title/artist)')
-      progress.done++
+      job.done++
       continue
     }
 
@@ -593,47 +768,52 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
         console.log('Error downloading:', err)
       }
     } finally {
-      if (!job.cancelled) progress.done++
+      if (!job.cancelled) job.done++
     }
   }
 
-  currentJob = null
-  fs.promises.unlink(req.file.path).catch(() => {})
+  job.child = null
 
-  // when we're done, reset progress after a little while (optional)
-  setTimeout(() => {
-    progress.total = 0
-    progress.done = 0
-    progress.tracks = []
-  }, 60_000)
+  const landed = fs.existsSync(tempFolder)
+    ? fs.readdirSync(tempFolder).filter((f) => !f.endsWith('_cover.jpg'))
+    : []
 
-  const landed = fs.readdirSync(tempFolder).filter((f) => !f.endsWith('_cover.jpg'))
-
-  if (saving) {
+  if (job.deliver === 'save') {
     // files are already where the user asked for them — nothing to ship back
-    return res.json({ saved: tempFolder, files: landed.length })
+    job.result = { saved: tempFolder, files: landed.length }
+  } else if (job.deliver === 'archive') {
+    // pack it onto this machine's disk: nobody may be holding a browser open
+    const name = safeName(job.folder) || 'songs'
+    const outFile = path.join(ZIP_ROOT, `${name}.zip`)
+    try {
+      const bytes = await writeArchive(tempFolder, outFile, name)
+      job.result = { archive: outFile, files: landed.length, bytes }
+      console.log('Wrote archive:', outFile)
+      // the staging copy has served its purpose
+      await fs.promises.rm(tempFolder, { recursive: true, force: true }).catch(() => {})
+    } catch (err) {
+      console.log('Could not write the archive:', err)
+      job.status = 'failed'
+      job.error = 'Could not write the archive: ' + (err.message || err)
+      return
+    }
+  } else {
+    // the archive is built on demand by /download, so it is still there if the
+    // page reloads between finishing and clicking
+    job.result = { download: `/download/${job.id}`, files: landed.length }
   }
 
-  // Create ZIP to send to user
-  res.setHeader('Content-Type', 'application/zip')
-  res.setHeader('Content-Disposition', 'attachment; filename=songs.zip')
-
-  const zip = archiver('zip')
-  zip.pipe(res)
-  zip.directory(tempFolder, false)
-  zip.finalize()
-
-  // the staging folder is scratch — do not leave one behind per rip
-  res.on('close', () => {
-    fs.promises.rm(tempFolder, { recursive: true, force: true }).catch(() => {})
-  })
-})
+  job.status = job.cancelled ? 'stopped' : 'done'
+}
 
 if (require.main === module) {
-  app.listen(3000, () => console.log('Server running at http://localhost:3000'))
+  // a previous run may have died mid-archive; nothing in there is ours to keep
+  clearStage()
+  const port = Number(process.env.PORT) || 3000
+  app.listen(port, () => console.log(`Server running at http://localhost:${port}`))
 }
 
 module.exports = {
   FORMATS, normalizeFormat, normalizeQuality, applyMetadataAndCover, parseProgress,
-  toTrack, resolveDest, readableError
+  toTrack, resolveDest, safeName, readableError
 }

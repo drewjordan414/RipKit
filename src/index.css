@@ -170,6 +170,28 @@ a { color: inherit; }
   font-size: 14px;
 }
 
+.saved {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* the archive waits on the server, so this stays clickable after a reload */
+.saved__get {
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: var(--bone);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.saved__get:hover { background: #fff; }
+
 .saved code,
 .dest__path code {
   font-family: var(--mono);

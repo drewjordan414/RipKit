@@ -33,9 +33,12 @@ export default defineConfig({
   server: {
     // the UI and API share an origin in dev, same as they do in production
     proxy: {
-      '/upload': { target: 'http://localhost:3000', proxyTimeout: 0, timeout: 0 },
+      '/upload': 'http://localhost:3000',
       '/preview': 'http://localhost:3000',
       '/progress': 'http://localhost:3000',
+      '/job': 'http://localhost:3000',
+      // the archive is built on demand and can be large, so no read timeout
+      '/download': { target: 'http://localhost:3000', proxyTimeout: 0, timeout: 0 },
       '/destination': 'http://localhost:3000',
       '/cancel': 'http://localhost:3000',
       '/art': 'http://localhost:3000'

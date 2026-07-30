@@ -45,18 +45,21 @@ A lossless container around already-compressed audio does not recover anything �
 
 ## Where files land
 
-Two delivery modes:
+You name the folder in the UI, and that name is used in all three delivery modes:
 
-- **ZIP download** (default) — your browser downloads one `songs.zip`. Nothing is kept on the server.
-- **Save to folder** — files are written straight into a folder on the machine running the server, and you name that folder in the UI.
+- **ZIP download** (default) — your browser downloads `<your name>.zip`, which unpacks into a folder of the same name instead of spraying tracks across `Downloads/`. Leave the field blank and you get `songs.zip`.
+- **ZIP on server** — the archive is written to `<zip root>/<your name>.zip` on the machine running the server, and nothing is sent to your browser. This is the one for a headless box: start the rip, close the tab, collect the zip over SSH later.
+- **Save to folder** — loose tagged files are written into `<save root>/<your name>` on the machine running the server.
 
-The save root defaults to `./downloads` and is set with the `DOWNLOAD_DIR` environment variable:
+The two roots default to folders in the project directory — `./output` for archives and `./downloads` for loose files — and each has an environment variable:
 
 ```bash
-DOWNLOAD_DIR=~/Music/Rips npm start
+ZIP_DIR=/srv/rips DOWNLOAD_DIR=~/Music/Rips npm start
 ```
 
-The folder you type in the UI becomes a subfolder of that root. It is treated as a *name*, never a path — separators and `..` are stripped, and any result landing outside the root is refused. Test coverage for that is in `test-formats.js`.
+Both are created on demand, and both are gitignored.
+
+The name you type is treated as a *name*, never a path — separators and `..` are stripped, and any result landing outside the root is refused. Test coverage for that is in `test-formats.js`.
 
 ### Docker
 
@@ -74,12 +77,27 @@ A folder named `Chill Mix` in the UI then lands at `/your/music/Chill Mix` on th
 ## How it works
 
 - **Preview:** `POST /preview` parses the CSV and looks up cover art on iTunes, so the tracklist can render before any downloading starts
-- **Upload:** the CSV is stored briefly in `uploads/` by `multer`
+- **Upload:** the CSV is stored briefly in `uploads/` by `multer`. `POST /upload` returns `202` as soon as the job is registered — it does not hold the socket open for the rip.
 - **Search:** `yt-search` finds the best matching YouTube video for each track
-- **Download:** `youtube-dl-exec` (yt-dlp) pulls the best audio-only stream into a temp folder like `mp3s_123456789/`. Unless you pick **Original**, yt-dlp shells out to ffmpeg to transcode into your chosen format.
+- **Download:** `youtube-dl-exec` (yt-dlp) pulls the best audio-only stream into `.staging/<job id>/`. Unless you pick **Original**, yt-dlp shells out to ffmpeg to transcode into your chosen format.
 - **Covers:** iTunes Search API provides square artwork, saved temporarily then embedded
 - **Tagging:** a second `ffmpeg` pass (`-c copy`, no re-encode) writes the tags and attaches the cover
-- **Packaging:** in ZIP mode `archiver` builds the archive, streams it back, and the staging folder is removed. In save mode the files are already in place, and the server returns a count instead.
+- **Packaging:** in ZIP mode `archiver` builds the archive on demand at `GET /download/<job id>`. In ZIP-on-server mode it is written straight to `ZIP_DIR` when the rip ends and the staging folder is dropped. In save mode the files are already in place, and the server reports a count instead.
+
+### Why the progress bar stays live
+
+The page polls `GET /progress` every 700 ms, and cover art comes from `POST /art`. Both share the handful of connections a browser gives one origin, so artwork is deliberately kept from crowding out progress:
+
+- **One request of each kind in flight at a time.** The art effect re-runs on every progress tick, and each finished track scrolls a fresh row into view — without a latch that fires a new `/art` on every tick. They pile up, and once more than about six are outstanding the browser queues `/progress` behind them and the page looks frozen until you reload.
+- **Everything has a deadline.** iTunes rate-limits at roughly 20 calls a minute and throttled calls hang, so every lookup gets an `AbortSignal` timeout, and `/art` returns whatever it has after 8 seconds. A missing cover is free; a stalled progress bar is not.
+
+### Closing the tab does not stop the rip
+
+The rip is server state, not page state. It is started by a request that returns immediately and keeps running on its own, so reloading, navigating away, or losing the tab leaves it alone.
+
+A page that loads asks `GET /job` for the job in flight and gets the whole tracklist back, so it redraws mid-rip exactly where it was; `GET /progress` then streams the deltas as before. Because the archive is built on demand rather than piped out of the upload request, a ZIP that finished while you were away is still sitting there when you come back — the page shows a download button for it. **Start over** issues `DELETE /job`, which is what actually clears it.
+
+One rip runs at a time: a second `POST /upload` while one is going gets a `409` rather than trampling it.
 
 ## Install & run
 
@@ -125,11 +143,13 @@ npm run dev        # http://localhost:5173
 | `npm start` | Builds the UI, serves everything from the Express server on :3000 |
 | `npm run dev` | Vite on :5173 with hot reload, plus the API on :3000 |
 | `npm run server` | Just the API, if you want to drive it yourself |
+| `npm test` | Both test suites |
 
-Check the format tagging logic without downloading anything:
+Neither suite downloads anything:
 
 ```bash
-node test-formats.js
+node test-formats.js   # tagging, cover embedding, column detection (needs ffmpeg)
+node test-job.js       # job lifecycle: reload survival, naming, cleanup
 ```
 
 ## How to use

@@ -14,6 +14,12 @@ const FORMATS = [
   { value: 'mp3', label: 'MP3', note: 'Re-encodes, so it loses a little. Worth it only if your player cannot read Opus or AAC — old iPods, car stereos, cheap DAPs.' }
 ]
 
+const DESTINATIONS = [
+  { value: 'zip', label: 'ZIP DOWNLOAD' },
+  { value: 'archive', label: 'ZIP ON SERVER' },
+  { value: 'save', label: 'SAVE TO FOLDER' }
+]
+
 // bitrate only means something when we are actually re-encoding
 const BITRATE_OK = ['mp3']
 
@@ -21,6 +27,11 @@ const STATUS_MARK = { done: '✓', failed: '✕', skipped: '–', stopped: '–'
 
 // how many rows land at a time
 const PAGE = 25
+
+// No request may sit open forever holding one of the browser's few
+// per-origin connections — progress is what the user is watching.
+const POLL_TIMEOUT = 5000
+const ART_TIMEOUT = 12000
 
 function Cover ({ art, className = '' }) {
   return art
@@ -116,26 +127,76 @@ function Stack ({ items, shown, onMore, label, count }) {
   )
 }
 
+// What a finished rip left behind. Each delivery mode ends somewhere
+// different, so each one says where.
+function Outcome ({ result, stopped, zipName }) {
+  const lead = stopped ? 'Stopped. ' : ''
+  const n = result.files
+  const plural = (one, many) => `${n} ${n === 1 ? one : many}`
+
+  if (result.saved) {
+    return (
+      <span>
+        {stopped ? 'Stopped. Kept ' : 'Saved '}
+        {plural('file', 'files')} in <code>{result.saved}</code>
+      </span>
+    )
+  }
+
+  if (result.archive) {
+    const mb = result.bytes ? ` (${(result.bytes / 1048576).toFixed(1)} MB)` : ''
+    return (
+      <span>
+        {lead}Wrote {plural('track', 'tracks')}{mb} to <code>{result.archive}</code>
+      </span>
+    )
+  }
+
+  if (!n) return <span>Nothing came back — every row failed or was skipped.</span>
+
+  return (
+    <>
+      <span>{lead}{plural('file is', 'files are')} ready.</span>
+      <a className='saved__get' href={result.download} download={`${zipName}.zip`}>
+        Download {zipName}.zip
+      </a>
+    </>
+  )
+}
+
 export default function App () {
   const [file, setFile] = useState(null)
   const [tracks, setTracks] = useState([])
   const [quality, setQuality] = useState('0')
   const [format, setFormat] = useState('original')
-  const [busy, setBusy] = useState(false)
+  // the rip as the server sees it — this page watches it, it does not own it
+  const [job, setJob] = useState(null)
+  const [starting, setStarting] = useState(false)
   const [reading, setReading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [deliver, setDeliver] = useState('zip')
   const [folder, setFolder] = useState('')
   const [root, setRoot] = useState('')
+  const [zipRoot, setZipRoot] = useState('')
   const [sep, setSep] = useState('/')
-  const [saved, setSaved] = useState(null)
   const [error, setError] = useState('')
   const [shownDone, setShownDone] = useState(PAGE)
   const [shownQueue, setShownQueue] = useState(PAGE)
   const inputRef = useRef(null)
   const artAsked = useRef(new Set())
+  // only auto-save the ZIP for the rip this tab kicked off; a reloaded page
+  // gets a button instead, because a download nobody clicked for is a surprise
+  const startedHere = useRef(null)
+  const grabbed = useRef(null)
+  // latches keeping each kind of request to one in flight — see the art effect
+  const artBusy = useRef(false)
+  const pollBusy = useRef(false)
+  const [artTick, setArtTick] = useState(0)
 
+  const busy = starting || job?.status === 'running'
+  const result = job && job.status !== 'running' ? job.result : null
+  const zipName = folder.trim() || 'songs'
   const noBitrate = !BITRATE_OK.includes(format)
 
   const indexed = tracks.map((track, index) => ({ track, index }))
@@ -149,11 +210,21 @@ export default function App () {
   const done = tracks.filter((t) => t.status === 'done').length
   const failed = tracks.filter((t) => t.status === 'failed' || t.status === 'skipped').length
 
+  // One poll in flight at a time. A slow response must delay the next tick,
+  // never stack up behind it.
   const syncProgress = async () => {
+    if (pollBusy.current) return
+    pollBusy.current = true
     try {
-      const res = await fetch('/progress')
+      const res = await fetch('/progress', { signal: AbortSignal.timeout(POLL_TIMEOUT) })
       if (!res.ok) return
       const data = await res.json()
+
+      if (data.job) {
+        setJob(data.job)
+        if (data.job.status !== 'running') setStopping(false)
+      }
+
       const moved = Object.entries(data.tracks || {})
       if (!moved.length) return
       // the server sends only rows that changed; everything else we already have
@@ -162,13 +233,31 @@ export default function App () {
         for (const [i, patch] of moved) next[i] = { ...next[i], ...patch }
         return next
       })
-    } catch { /* server is mid-rip; the next tick retries */ }
+    } catch { /* server is mid-rip; the next tick retries */ } finally {
+      pollBusy.current = false
+    }
   }
 
+  // A rip lives on the server, not in this tab. On load, ask whether one is
+  // already going and pick it back up — reloading mid-rip should cost you the
+  // scroll position and nothing else.
   useEffect(() => {
     fetch('/destination')
       .then((r) => r.json())
-      .then((d) => { setRoot(d.root); setSep(d.separator) })
+      .then((d) => { setRoot(d.root); setZipRoot(d.zipRoot); setSep(d.separator) })
+      .catch(() => {})
+
+    fetch('/job')
+      .then((r) => r.json())
+      .then((data) => {
+        if (!data.job) return
+        setJob(data.job)
+        setTracks(data.tracks)
+        setFormat(data.job.format)
+        setQuality(data.job.quality)
+        setDeliver(data.job.deliver)
+        setFolder(data.job.folder)
+      })
       .catch(() => {})
   }, [])
 
@@ -178,9 +267,31 @@ export default function App () {
     return () => clearInterval(id)
   }, [busy])
 
+  // ZIP mode: the rip this tab started saves itself the moment it is ready.
+  useEffect(() => {
+    if (!result?.download || !result.files) return
+    if (grabbed.current === job.id || job.id !== startedHere.current) return
+    grabbed.current = job.id
+
+    const a = document.createElement('a')
+    a.href = result.download
+    a.download = `${zipName}.zip`
+    a.click()
+  }, [result, job, zipName])
+
   // Cover art for the rows on screen, a page at a time. Fetching art for the
   // whole CSV up front does not survive a 17k-row library export.
+  //
+  // Strictly one request at a time. This effect re-runs on every progress
+  // tick, and each finished track scrolls a fresh row into view — so without
+  // a latch it fires a new /art on every tick. iTunes throttles at around 20
+  // calls a minute, the throttled ones hang, and a browser only gives an
+  // origin ~6 connections. They fill up, /progress queues behind them, and
+  // the page looks frozen until you reload. Artwork must never outrank the
+  // progress the user is actually watching.
   useEffect(() => {
+    if (artBusy.current) return
+
     const visible = [
       ...(active ? [{ track: active, index: activeIdx }] : []),
       ...finished.slice(0, shownDone),
@@ -194,6 +305,7 @@ export default function App () {
 
     if (!need.length) return
     need.forEach(({ index }) => artAsked.current.add(index))
+    artBusy.current = true
 
     ;(async () => {
       try {
@@ -204,7 +316,8 @@ export default function App () {
             tracks: need.map(({ track, index }) => ({
               index, title: track.title, artist: track.artist
             }))
-          })
+          }),
+          signal: AbortSignal.timeout(ART_TIMEOUT)
         })
         const { art } = await res.json()
         setTracks((prev) => {
@@ -215,9 +328,13 @@ export default function App () {
       } catch {
         // let a later render retry these
         need.forEach(({ index }) => artAsked.current.delete(index))
+      } finally {
+        artBusy.current = false
+        // the rip may already be finished, so nothing else would re-run this
+        setArtTick((t) => t + 1)
       }
     })()
-  }, [tracks, shownDone, shownQueue, activeIdx])
+  }, [tracks, shownDone, shownQueue, activeIdx, artTick])
 
   const pick = async (f) => {
     if (!f) return
@@ -228,7 +345,7 @@ export default function App () {
 
     setError('')
     setFile(f)
-    setSaved(null)
+    setJob(null) // a new CSV means the last rip's result banner is stale
     setFolder((prev) => prev || f.name.replace(/\.csv$/i, ''))
     setTracks([])
     setShownDone(PAGE)
@@ -252,10 +369,13 @@ export default function App () {
     }
   }
 
+  // Kick the rip off and step back. The request returns as soon as the server
+  // has the job, so nothing about this page's lifetime is holding it up.
   const rip = async () => {
     if (!file || busy) return
-    setBusy(true)
+    setStarting(true)
     setStopping(false)
+    setJob(null)
     setError('')
     setShownDone(PAGE)
     setShownQueue(PAGE)
@@ -272,52 +392,43 @@ export default function App () {
 
     try {
       const res = await fetch('/upload', { method: 'POST', body })
-      if (!res.ok) {
-        const why = await res.json().catch(() => ({}))
-        throw new Error(why.error || `server responded ${res.status}`)
-      }
-
-      if ((res.headers.get('Content-Type') || '').includes('application/json')) {
-        const data = await res.json()
-        setSaved(data)
-      } else {
-        const url = URL.createObjectURL(await res.blob())
-        const a = document.createElement('a')
-        a.href = url
-        a.download = 'songs.zip'
-        a.click()
-        URL.revokeObjectURL(url)
-      }
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `server responded ${res.status}`)
+      startedHere.current = data.job.id
+      setJob(data.job)
     } catch (err) {
       setError(`Rip failed: ${err.message}. Check the terminal running the server.`)
     } finally {
-      // one last read, so a stopped rip does not leave a row stuck on "working"
-      await syncProgress()
-      setBusy(false)
-      setStopping(false)
+      setStarting(false)
     }
   }
 
-  // Stop the rip. The server kills the running download and still returns a
-  // ZIP of whatever finished, so a stop is never a total loss.
+  // Stop the rip. The server kills the running download and still packages
+  // whatever finished, so a stop is never a total loss.
   const stop = async () => {
     setStopping(true)
     try {
       await fetch('/cancel', { method: 'POST' })
+      await syncProgress()
     } catch {
       setError('Could not reach the server to stop the rip.')
       setStopping(false)
     }
   }
 
-  const reset = () => {
+  // Clear the finished job on the server too, or it comes straight back on the
+  // next reload.
+  const reset = async () => {
     setFile(null)
     setTracks([])
+    setJob(null)
+    setFolder('')
     setShownDone(PAGE)
     setShownQueue(PAGE)
     artAsked.current = new Set()
     setError('')
     if (inputRef.current) inputRef.current.value = ''
+    await fetch('/job', { method: 'DELETE' }).catch(() => {})
   }
 
   const loaded = tracks.length > 0
@@ -385,10 +496,12 @@ export default function App () {
 
       {error && <p className='error'>{error}</p>}
 
-      {saved && (
-        <p className='saved'>
-          Saved {saved.files} {saved.files === 1 ? 'file' : 'files'} to <code>{saved.saved}</code>
-        </p>
+      {job?.status === 'failed' && <p className='error'>Rip failed: {job.error}</p>}
+
+      {result && (
+        <div className='saved'>
+          <Outcome result={result} stopped={job.status === 'stopped'} zipName={zipName} />
+        </div>
       )}
 
       {loaded && (
@@ -417,46 +530,57 @@ export default function App () {
             <fieldset className='pills' disabled={busy}>
               <legend>Where it goes</legend>
               <div className='pills__row'>
-                <button
-                  type='button'
-                  className={deliver === 'zip' ? 'is-on' : ''}
-                  aria-pressed={deliver === 'zip'}
-                  onClick={() => setDeliver('zip')}
-                >
-                  ZIP download
-                </button>
-                <button
-                  type='button'
-                  className={deliver === 'save' ? 'is-on' : ''}
-                  aria-pressed={deliver === 'save'}
-                  onClick={() => setDeliver('save')}
-                >
-                  Save to folder
-                </button>
+                {DESTINATIONS.map((d) => (
+                  <button
+                    key={d.value}
+                    type='button'
+                    className={deliver === d.value ? 'is-on' : ''}
+                    aria-pressed={deliver === d.value}
+                    onClick={() => setDeliver(d.value)}
+                  >
+                    {d.label}
+                  </button>
+                ))}
               </div>
 
-              {deliver === 'save'
-                ? (
-                  <div className='dest'>
-                    <input
-                      className='dest__input'
-                      value={folder}
-                      placeholder='folder name'
-                      disabled={busy}
-                      onChange={(e) => setFolder(e.target.value)}
-                    />
-                    <p className='dest__path'>
-                      {root
-                        ? <>Files land in <code>{root}{sep}{folder || ''}</code></>
-                        : 'Reading the server download folder…'}
-                    </p>
-                  </div>
-                  )
-                : (
-                  <p className='pills__note'>
-                    Your browser downloads one <code>songs.zip</code>. Nothing is kept on the server.
+              {/* One folder name, both destinations: it names the folder on
+                  disk when saving, and the folder inside the archive when
+                  zipping — so a ZIP unpacks into something, not everywhere. */}
+              <div className='dest'>
+                <input
+                  className='dest__input'
+                  value={folder}
+                  placeholder={deliver === 'save' ? 'folder name' : 'songs'}
+                  aria-label='Folder name'
+                  disabled={busy}
+                  onChange={(e) => setFolder(e.target.value)}
+                />
+                {deliver === 'save' && (
+                  <p className='dest__path'>
+                    {root
+                      ? <>Files land in <code>{root}{folder ? sep + folder : ''}</code></>
+                      : 'Reading the server download folder…'}
                   </p>
-                  )}
+                )}
+
+                {deliver === 'archive' && (
+                  <p className='dest__path'>
+                    {zipRoot
+                      ? <>The archive is written to <code>{zipRoot}{sep}{zipName}.zip</code> on
+                        the machine running the server. Nothing is sent to your browser, so
+                        you can close the tab.</>
+                      : 'Reading the server output folder…'}
+                  </p>
+                )}
+
+                {deliver === 'zip' && (
+                  <p className='dest__path'>
+                    Your browser downloads <code>{zipName}.zip</code>, which unpacks
+                    into a <code>{zipName}</code> folder. The server holds it until you
+                    rip again or start over, so a reload cannot lose it.
+                  </p>
+                )}
+              </div>
             </fieldset>
 
             <fieldset className='pills' disabled={noBitrate || busy}>
@@ -488,10 +612,14 @@ export default function App () {
                 </button>
                 )
               : (
-                <button className='go' onClick={rip}>
-                  {format === 'original'
-                    ? 'Rip at source quality'
-                    : `Rip to ${format.toUpperCase()}`}
+                // after a reload the tracklist comes back from the server but
+                // the CSV does not — the file input is the browser's to give
+                <button className='go' onClick={rip} disabled={!file}>
+                  {!file
+                    ? 'Drop the CSV again to rip'
+                    : format === 'original'
+                      ? 'Rip at source quality'
+                      : `Rip to ${format.toUpperCase()}`}
                 </button>
                 )}
           </section>
